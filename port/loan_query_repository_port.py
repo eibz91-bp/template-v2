@@ -1,0 +1,6 @@
+from typing import Protocol
+
+
+class LoanQueryRepositoryPort(Protocol):
+    async def get_with_user(self, loan_id: str) -> dict | None: ...
+    async def get_by_user(self, user_id: str) -> list[dict]: ...
