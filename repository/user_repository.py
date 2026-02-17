@@ -1,39 +1,40 @@
-import asyncpg
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from database.context import get_current_connection
+from database.context import get_current_session
 from entity.user import User
 from exception.decorators import handle_db_errors
 from exception.domain import AlreadyExistsError
+from model.user_model import UserModel
 
 
 class UserRepository:
 
     @handle_db_errors
     async def get_by_id(self, user_id: str) -> User | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            "SELECT * FROM users WHERE id = $1", user_id
+        session = get_current_session()
+        result = await session.execute(
+            select(UserModel).where(UserModel.id == user_id)
         )
-        return User.from_record(record) if record else None
+        model = result.scalars().first()
+        return model.to_entity() if model else None
 
     @handle_db_errors
     async def get_by_email(self, email: str) -> User | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            "SELECT * FROM users WHERE email = $1", email
+        session = get_current_session()
+        result = await session.execute(
+            select(UserModel).where(UserModel.email == email)
         )
-        return User.from_record(record) if record else None
+        model = result.scalars().first()
+        return model.to_entity() if model else None
 
     @handle_db_errors
     async def create(self, email: str, name: str) -> User:
         try:
-            conn = get_current_connection()
-            record = await conn.fetchrow(
-                """INSERT INTO users (email, name)
-                   VALUES ($1, $2)
-                   RETURNING *""",
-                email, name
-            )
-            return User.from_record(record)
-        except asyncpg.UniqueViolationError:
+            session = get_current_session()
+            model = UserModel(email=email, name=name)
+            session.add(model)
+            await session.flush()
+            return model.to_entity()
+        except IntegrityError:
             raise AlreadyExistsError("User with this email already exists")

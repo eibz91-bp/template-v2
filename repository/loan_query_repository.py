@@ -1,30 +1,63 @@
-from database.context import get_current_connection
+from sqlalchemy import select
+
+from database.context import get_current_session
 from exception.decorators import handle_db_errors
+from model.loan_model import LoanModel
+from model.user_model import UserModel
 
 
 class LoanQueryRepository:
 
     @handle_db_errors
     async def get_with_user(self, loan_id: str) -> dict | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            """SELECT l.id, l.amount, l.status, l.score, l.created_at,
-                      u.name as user_name, u.email as user_email
-               FROM loans l
-               JOIN users u ON l.user_id = u.id
-               WHERE l.id = $1""",
-            loan_id
+        session = get_current_session()
+        result = await session.execute(
+            select(
+                LoanModel.id,
+                LoanModel.amount,
+                LoanModel.status,
+                LoanModel.score,
+                LoanModel.created_at,
+                UserModel.name.label("user_name"),
+                UserModel.email.label("user_email"),
+            )
+            .join(UserModel, LoanModel.user_id == UserModel.id)
+            .where(LoanModel.id == loan_id)
         )
-        return dict(record) if record else None
+        row = result.first()
+        if not row:
+            return None
+        return {
+            "id": row.id,
+            "amount": row.amount,
+            "status": row.status,
+            "score": row.score,
+            "created_at": row.created_at,
+            "user_name": row.user_name,
+            "user_email": row.user_email,
+        }
 
     @handle_db_errors
     async def get_by_user(self, user_id: str) -> list[dict]:
-        conn = get_current_connection()
-        records = await conn.fetch(
-            """SELECT l.id, l.amount, l.status, l.score, l.created_at
-               FROM loans l
-               WHERE l.user_id = $1
-               ORDER BY l.created_at DESC""",
-            user_id
+        session = get_current_session()
+        result = await session.execute(
+            select(
+                LoanModel.id,
+                LoanModel.amount,
+                LoanModel.status,
+                LoanModel.score,
+                LoanModel.created_at,
+            )
+            .where(LoanModel.user_id == user_id)
+            .order_by(LoanModel.created_at.desc())
         )
-        return [dict(r) for r in records]
+        return [
+            {
+                "id": row.id,
+                "amount": row.amount,
+                "status": row.status,
+                "score": row.score,
+                "created_at": row.created_at,
+            }
+            for row in result.all()
+        ]

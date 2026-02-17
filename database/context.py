@@ -1,25 +1,27 @@
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
-current_connection: ContextVar = ContextVar("current_connection")
+from sqlalchemy.ext.asyncio import AsyncSession
+
+current_session: ContextVar[AsyncSession] = ContextVar("current_session")
 
 
-def get_current_connection():
+def get_current_session() -> AsyncSession:
     try:
-        return current_connection.get()
+        return current_session.get()
     except LookupError:
         raise RuntimeError(
-            "No database connection available. "
-            "Use 'async with connection_context(database)' or "
+            "No database session available. "
+            "Use 'async with session_context(database)' or "
             "ensure Depends(get_db_connection) is configured."
         )
 
 
 @asynccontextmanager
-async def connection_context(database):
-    async with database.pool.acquire() as conn:
-        token = current_connection.set(conn)
+async def session_context(database):
+    async with database.session_factory() as session:
+        token = current_session.set(session)
         try:
-            yield conn
+            yield session
         finally:
-            current_connection.reset(token)
+            current_session.reset(token)

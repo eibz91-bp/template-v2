@@ -1,7 +1,7 @@
 from functools import wraps
 
-import asyncpg
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
 from exception.base import AppException
 from exception.infrastructure import (
@@ -19,7 +19,7 @@ def handle_db_errors(func):
             return await func(*args, **kwargs)
         except AppException:
             raise
-        except asyncpg.PostgresError as e:
+        except SQLAlchemyError as e:
             raise DatabaseException(str(e))
     return wrapper
 

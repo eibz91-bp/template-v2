@@ -1,570 +1,747 @@
 # Architecture Decision Records (ADR)
 
-Registro de todas las decisiones arquitectónicas discutidas, con contexto, opciones evaluadas, justificación y consecuencias.
+Record of all architectural decisions discussed, with context, options evaluated, justification, and consequences.
 
-**Formato:** Cada ADR sigue la estructura: Contexto → Opciones → Decisión → Justificación → Consecuencias.
+**Format:** Each ADR follows the structure: Context → Options → Decision → Justification → Consequences.
 
 ---
 
-## ADR-001: Full Async en toda la cadena
+## Guiding Principles
 
-**Status:** Aceptado
+This is not about Clean Architecture, hexagonal, or DDD. It is about a set of simple principles that guide every decision in this document:
 
-**Contexto:**
-FastAPI corre sobre un event loop async. Si cualquier método en la cadena (controller → use case → repository → service) es sync y hace I/O, bloquea el event loop completo. Ningún otro request se procesa hasta que termine.
+| # | Principle | What it means | ADRs that reflect it |
+|---|---|---|---|
+| 1 | **Business does not depend on technology** | Exceptions don't know about HTTP. Entities don't know about SQLAlchemy. Use cases don't know about FastAPI. If you change the framework, the domain doesn't notice | 004, 009, 011, 012 |
+| 2 | **Code reads top to bottom** | A use case reads as a sequence: linear guards (preconditions that exit if they fail), then the happy path. Zero try/catch in business logic — exceptions bubble up and the handler translates them. Explicit commit, one pattern per problem. PEP 8 style enforced by tooling | 003, 004, 005, 013 |
+| 3 | **Dependencies go in one direction** | Controller → Use Case → Port ← Repository. Inner layers never import from outer ones. If an import goes "outward", something is wrong | 009, 012 |
+| 4 | **Layers communicate through contracts** | The use case sees a Protocol, not a concrete class. If the implementation changes, the contract holds. Duck typing with static verification. mypy --strict ensures contracts are fulfilled before running | 009, 014 |
+| 5 | **Entities know their own rules** | The entity is an expert on itself: it knows if it can be evaluated, if it can be disbursed. It doesn't know how to save itself, it doesn't know how to call providers. That belongs to the system | 010 |
+| 6 | **Errors belong to the domain** | `InvalidOperationError`, not `HTTPException(422)`. The domain throws typed exceptions. Each protocol (HTTP, gRPC, CLI) translates them to its own format | 004 |
+| 7 | **Decisions are documented and can be challenged** | Every ADR has rejected options with justification. If the context changes, the decision can be reversed with the same transparency | This document |
+| 8 | **Discipline sustains everything else** | Patterns only work if the team follows them. A single sync `requests.post()` breaks async. A single try/catch in a use case breaks consistency. A `def f(x):` without types breaks the safety net. Ruff + mypy in CI = automatic enforcement | All |
+| 9 | **AI accelerates, humans decide** | AI generates code, proposes ADRs, writes tests. Humans review, challenge, and have the final word. No architectural decision is accepted just because AI suggested it | All |
+| 10 | **Complexity is added when it hurts, not before** | CQRS lite instead of event sourcing. Anemic until the entity needs rules. No outbox until eventual consistency requires it. The right abstraction is the one that solves a real problem, not an imaginary one | 007, 010 |
 
-**Opciones consideradas:**
+Each ADR is an instance of these principles applied to a concrete problem.
 
-| Opción | Descripción |
+---
+
+
+
+## Summary of decisions
+
+| ADR | Decision | Main rejected alternative |
+|---|---|---|
+| 001 | Full async | Sync with threads |
+| 002 | Session context manager + contextvars + Depends | Middleware |
+| 003 | transaction_context + explicit commit | Implicit decorator / dual pattern |
+| 004 | Hierarchy + decorators + HTTP handler | Try/catch in every layer |
+| 005 | Mixed (Pydantic + ORM model + dataclass + dict) | Pydantic everywhere |
+| 006 | SQLAlchemy ORM + Alembic autogenerate | Raw asyncpg / SQLAlchemy Core |
+| 007 | CQRS Lite (write + query repos) | JOINs in write repos |
+| 008 | Unit (controller/UC) + Integration (repo) | All unit tests with mocks |
+| 009 | Python Protocols | ABC / No interfaces |
+| 010 | Entities as experts on themselves | Permanently anemic / Full rich entities |
+| 011 | schema/ (HTTP) + entity/ (domain) | One model for everything |
+| 012 | Manual container + app.state + Depends() | DI Container library / wiring in app.py |
+| 013 | PEP 8 +  Flake8 + isort + black |
+| 014 | mypy --strict (financial project) | No type checking / basic mypy |
+| 015 | Poetry (financial project) | pip + requirements.txt / uv |
+
+---
+
+## ADR-001: Full Async across the entire chain
+
+**Status:** Accepted
+
+**Context:**
+FastAPI runs on an async event loop. If any method in the chain (controller → use case → repository → service) is sync and performs I/O, it blocks the entire event loop. No other request gets processed until it finishes.
+
+**Options considered:**
+
+| Option | Description |
 |---|---|
-| A) Full async | Toda la cadena es `async/await`. Librerías async en cada capa |
-| B) Sync con threads | Usar `run_in_executor` para wrappear llamadas sync |
-| C) Mixto | Async en controller, sync en repos/services |
+| A) Full async | The entire chain is `async/await`. Async libraries at every layer |
+| B) Sync with threads | Use `run_in_executor` to wrap sync calls |
+| C) Mixed | Async in controller, sync in repos/services |
 
-**Por qué NO las otras:**
-- **B) Sync con threads:** Introduce overhead de context switching. Pierde las ventajas del event loop. Cada thread consume ~8MB de stack. No escala con miles de conexiones concurrentes.
-- **C) Mixto:** Crea confusión sobre qué es async y qué no. Un solo `requests.post()` en un service bloquea todo. El developer tiene que recordar dónde es seguro llamar sync — propenso a errores silenciosos.
+**Why NOT the others:**
+- **B) Sync with threads:** Introduces context switching overhead. Loses the event loop advantages. Each thread consumes ~8MB of stack. Doesn't scale with thousands of concurrent connections.
+- **C) Mixed:** Creates confusion about what is async and what is not. A single `requests.post()` in a service blocks everything. The developer has to remember where it's safe to call sync — prone to silent errors.
 
-**Decisión:** Opción A — Full async.
+**Decision:** Option A — Full async.
 
-**Justificación:**
-- Un solo event loop maneja miles de conexiones concurrentes con ~KB por coroutine (vs ~MB por thread)
-- Si olvidas `await`, Python lanza un `RuntimeWarning` que con `PYTHONWARNINGS=error::RuntimeWarning` se convierte en excepción — detectable antes de producción
-- asyncpg es ~3x más rápido que psycopg2 en benchmarks
-- El equipo necesita aprender un solo modelo mental: si cruza la frontera del proceso → `await`
+**Justification:**
+- A single event loop handles thousands of concurrent connections with ~KB per coroutine (vs ~MB per thread)
+- If you forget `await`, Python throws a `RuntimeWarning` which with `PYTHONWARNINGS=error::RuntimeWarning` becomes an exception — detectable before production
+- The team needs to learn a single mental model: if it crosses the process boundary → `await`
 
-**Consecuencias:**
-- (+) Performance superior bajo carga concurrente
-- (+) Modelo mental consistente en toda la app
-- (-) Toda dependencia nueva debe tener soporte async. Si no existe, `asyncio.to_thread()` como último recurso
-- (-) Debugging de async puede ser más complejo (stack traces más largos)
-- (-) El equipo debe aprender async/await si no lo conoce
+**Consequences:**
+- (+) Superior performance under concurrent load
+- (+) Consistent mental model across the entire app
+- (-) Every new dependency must have async support. If it doesn't exist, `asyncio.to_thread()` as a last resort
+- (-) Debugging async can be more complex (longer stack traces)
+- (-) The team must learn async/await if they don't know it
 
-**Stack elegido:**
+**Stack chosen:**
 
-| Capa | Async | Sync (rechazado) |
+| Layer | Async | Sync (rejected) |
 |---|---|---|
 | HTTP Framework | FastAPI | Flask |
-| Base de datos | asyncpg | psycopg2 |
+| Database | SQLAlchemy async + asyncpg | psycopg2 |
 | HTTP Client | httpx.AsyncClient | requests |
 | Redis | redis.asyncio | redis |
 | AWS | aioboto3 | boto3 |
 
 ---
 
-## ADR-002: Connection Pool + Session por Request via Context Manager
+## ADR-002: Session Pool per Request via Context Manager
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Los repositories son singletons stateless. Cada request HTTP necesita su propia conexión a BD para evitar que requests concurrentes interfieran entre sí. Necesitamos un mecanismo que funcione tanto para HTTP (FastAPI) como para non-HTTP (workers, scripts, crons).
+**Context:**
+Repositories are stateless singletons. Each HTTP request needs its own DB session to prevent concurrent requests from interfering with each other. We need a mechanism that works for both HTTP (FastAPI) and non-HTTP (workers, scripts, crons).
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) Middleware | Middleware de FastAPI que adquiere conexión antes de cada request |
-| B) Depends + Context Manager | `connection_context` reutilizable + FastAPI `Depends` como adapter |
-| C) Conexión por query | Cada método del repo adquiere y libera su propia conexión |
+| A) Middleware | FastAPI middleware that acquires a session before each request |
+| B) Depends + Context Manager | Reusable `session_context` + FastAPI `Depends` as adapter |
+| C) Session per query | Each repo method acquires and releases its own session |
 
-**Por qué NO las otras:**
-- **A) Middleware:** Solo funciona para HTTP. Workers, scripts y crons necesitan otro mecanismo. Además, adquiere conexión para TODOS los endpoints — incluso `/health` que no toca BD, desperdiciando conexiones del pool.
-- **C) Conexión por query:** Imposible hacer transacciones que cruzan múltiples repos (el UPDATE de un repo y el INSERT de otro no comparten conexión). También más overhead por acquire/release en cada query.
+**Why NOT the others:**
+- **A) Middleware:** Only works for HTTP. Workers, scripts, and crons need a different mechanism. Also, it acquires a session for ALL endpoints — including `/health` which doesn't touch the DB, wasting pool connections.
+- **C) Session per query:** Impossible to do transactions that span multiple repos (the UPDATE from one repo and the INSERT from another don't share a session). Also more overhead from acquire/release on each query.
 
-**Decisión:** Opción B — `connection_context` (context manager) + `contextvars` + FastAPI `Depends` como adapter.
+**Decision:** Option B — `session_context` (context manager) + `contextvars` + FastAPI `Depends` as adapter.
 
-**Justificación:**
-- **Un solo mecanismo** para todo: HTTP usa `Depends(get_db_connection)` que internamente llama `connection_context`. Workers/scripts llaman `async with connection_context(database)` directamente
-- **No desperdicia conexiones:** Solo los endpoints que tienen `Depends` adquieren conexión
-- **Testeable:** `app.dependency_overrides` para tests de FastAPI, `connection_context` directo para integration tests
-- **Transacciones posibles:** Todos los repos de un request ven la misma conexión via `contextvars`, permitiendo transacciones atómicas
+**Justification:**
+- **A single mechanism** for everything: HTTP uses `Depends(get_db_connection)` which internally calls `session_context`. Workers/scripts call `async with session_context(database)` directly
+- **Doesn't waste connections:** Only endpoints that have `Depends` acquire a session
+- **Testable:** `app.dependency_overrides` for FastAPI tests, direct `session_context` for integration tests
+- **Transactions possible:** All repos in a request see the same session via `contextvars`, enabling atomic transactions
 
-**Consecuencias:**
-- (+) Repos son singletons puros (sin `__init__` con DB)
-- (+) Workers, scripts y crons usan el mismo mecanismo que HTTP
-- (+) Pool configurable (min_size, max_size) según carga
-- (-) `contextvars` es implícito — si un developer llama un repo fuera de un `connection_context`, obtiene un `RuntimeError` claro pero en runtime, no en compile time
-- (-) El developer debe entender que `get_current_connection()` retorna la conexión del request actual, no una conexión global
+**Consequences:**
+- (+) Repos are pure singletons (no `__init__` with DB)
+- (+) Workers, scripts, and crons use the same mechanism as HTTP
+- (+) Configurable pool (pool_size, max_overflow) based on load
+- (-) `contextvars` is implicit — if a developer calls a repo outside a `session_context`, they get a clear `RuntimeError` but at runtime, not at compile time
+- (-) The developer must understand that `get_current_session()` returns the current request's session, not a global session
 
 ---
 
-## ADR-003: Transacciones — Decorator + Context Manager Explícito
+## ADR-003: Transactions — Context Manager with explicit commit
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Un use case puede llamar a múltiples repositorios. Si uno falla después de que otro ya insertó datos, la BD queda en estado inconsistente. Necesitamos atomicidad. Pero no todos los use cases son iguales — algunos solo tocan BD, otros llaman a terceros y necesitan la respuesta antes de decidir qué guardar.
+**Context:**
+A use case can call multiple repositories. If one fails after another has already inserted data, the DB is left in an inconsistent state. We need atomicity. But not all use cases are equal — some only touch the DB, others call third parties and need the response before deciding what to save.
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) Transaction manual | Cada use case maneja su propio `async with conn.transaction()` |
-| B) Decorator único | `@transactional` wrappea todo el `execute()` |
-| C) Decorator + Context Manager | `@transactional` para use cases simples, `transaction_context` explícito para complejos |
+| A) Manual transaction | Each use case manages its own `async with conn.transaction()` with begin/commit/rollback |
+| B) Single decorator | `@transactional` wraps the entire `execute()` — implicit commit |
+| C) Decorator + Context Manager | `@transactional` for simple ones, `transaction_context` for complex ones |
+| D) Single Context Manager | `transaction_context` for all, explicit commit always |
 
-**Por qué NO las otras:**
-- **A) Transaction manual:** Boilerplate repetido en cada use case. Fácil olvidar el rollback. El use case se llena de código de infraestructura.
-- **B) Decorator único:** No funciona para Type 3 (BD + tercero). Si wrappeas todo en una transacción y la llamada HTTP al tercero tarda 5 segundos, la conexión queda bloqueada 5 segundos con un lock en la tabla. Bajo carga, el pool se agota.
+**Why NOT the others:**
+- **A) Manual transaction:** Repeated boilerplate in every use case. Easy to forget the rollback. The use case gets filled with infrastructure code.
+- **B) Single decorator:** Doesn't work for use cases that call third parties (Type 3). If you wrap everything in a transaction and the HTTP call to the third party takes 5 seconds, the connection stays blocked for 5 seconds with a lock on the table. Under load, the pool runs out. Also, the commit is invisible — hidden inside the decorator.
+- **C) Decorator + Context Manager:** Works, but introduces two distinct patterns. The developer must choose which to use. The decorator hides the commit — a single explicit pattern is clearer.
 
-**Decisión:** Opción C — `@transactional` + `transaction_context`.
+**Decision:** Option D — `transaction_context()` with explicit `await tx.commit()` for all use cases.
 
-**Justificación:**
+**Justification:**
 
-Se identificaron 3 tipos de use case:
+A single pattern for all types of use cases:
 
-| Tipo | Ejemplo | Mecanismo |
+| Type | Example | Pattern |
 |---|---|---|
-| Tipo 1: Solo BD | CreateLoan, RegisterUser | `@transactional` — simple, limpio |
-| Tipo 2: BD + fire-and-forget | ApproveLoan (+ notificación) | `@transactional` — el outbox es BD |
-| Tipo 3: BD + tercero que necesita respuesta | DisburseLoan, EvaluateLoan | `transaction_context` explícito — 2 transacciones con llamada HTTP en medio |
+| Type 1: DB only | RegisterUser, RequestLoan | 1 `transaction_context` block + `tx.commit()` |
+| Type 2: DB + external service | EvaluateLoan, DisburseLoan | 2 `transaction_context` blocks, external call between them |
+| Type 3: Read only | GetLoanDetail | No transaction |
 
-Para Type 3, el patrón es:
-1. Transaction 1: marcar status intermedio (idempotente)
-2. Llamada al tercero (fuera de transacción)
-3. Transaction 2: guardar resultado
+For Type 2, the pattern is:
+1. Transaction 1: mark intermediate status (idempotent) + `tx.commit()`
+2. Call to third party (outside transaction)
+3. Transaction 2: save result + `tx.commit()`
 
-**Consecuencias:**
-- (+) El developer tiene una regla clara: ¿llamas a tercero y necesitas la respuesta? → `transaction_context`. ¿Todo lo demás? → `@transactional`
-- (+) Status intermedios (`scoring`, `disbursing`) + reconciliación = red de seguridad para Type 3
-- (+) Outbox pattern para fire-and-forget evita llamadas externas dentro de transacciones
-- (-) Type 3 requiere más código y más cuidado
-- (-) El developer debe elegir correctamente entre los dos mecanismos
+Example (all types read the same way):
+```python
+async with transaction_context() as tx:
+    await self.loan_repo.update_status(loan_id, "disbursed")
+    await tx.commit()
+```
 
----
-
-## ADR-004: Exception Handling — Jerarquía + Decorators + Handler Global
-
-**Status:** Aceptado
-
-**Contexto:**
-Sin estrategia de errores, cada developer pone try/catch donde le parece. Errores de BD se exponen al cliente (`asyncpg.UniqueViolationError`). Responses inconsistentes (`{"error": "..."}` vs `{"message": "..."}` vs stack traces). Use cases y controllers llenos de try/catch que oscurecen la lógica de negocio.
-
-**Opciones consideradas:**
-
-| Opción | Descripción |
-|---|---|
-| A) Try/catch en cada capa | Cada capa catchea y re-lanza sus errores |
-| B) Handler global único | Un solo catch-all en FastAPI traduce todo |
-| C) Jerarquía + Decorators + Handler | Excepciones tipadas + decorators en repos/services + handler global |
-
-**Por qué NO las otras:**
-- **A) Try/catch en cada capa:** Controller tiene try/catch, use case tiene try/catch, repo tiene try/catch. 3 niveles de catch para un solo error. El código se vuelve ilegible. Si alguien olvida un catch, el error sube sin traducir.
-- **B) Handler global único:** Funciona, pero el handler necesita `isinstance` checks para saber qué tipo de error es. Si el repo lanza `asyncpg.UniqueViolationError`, el handler global necesita conocer asyncpg — acoplamiento directo entre el handler HTTP y la librería de BD.
-
-**Decisión:** Opción C — Jerarquía tipada + Decorators en infraestructura + Handler global.
-
-**Justificación:**
-- **Decorators (`@handle_db_errors`, `@handle_external_errors`)** en repos/services traducen errores de librerías a la jerarquía de la app. El repo puede hacer un try/catch puntual para errores con significado de negocio (ej: `UniqueViolation → AlreadyExistsError`). Todo lo demás → decorator → `DatabaseException(503)`
-- **Use cases y controllers:** CERO try/catch. Solo lanzan guardas (`if not entity: raise EntityNotFoundError`). Se leen como libro.
-- **Handler global:** Catchea por categoría (`DomainException`, `DatabaseException`, `ExternalServiceException`, `Exception`). Un handler por categoría, cero `isinstance`
-
-**Consecuencias:**
-- (+) Use cases y controllers limpios — solo lógica de negocio
-- (+) Responses HTTP consistentes siempre
-- (+) Agregar un nuevo tipo de error = agregar una clase, no modificar handlers
-- (+) Errores de infra nunca se exponen al cliente (503 genérico para BD, 502/504 para externos)
-- (-) La jerarquía debe mantenerse coherente — si alguien lanza `Exception` directamente, cae al catch-all (500)
-- (-) Los decorators atrapan `AppException` y la dejan pasar — si alguien no entiende esto, puede confundirse
+**Consequences:**
+- (+) A single pattern — the developer doesn't have to choose between mechanisms
+- (+) Every commit is visible in the code — zero hidden behavior
+- (+) Automatic rollback if an exception occurs before commit (the context manager handles it)
+- (+) Intermediate statuses (`scoring`, `disbursing`) + reconciliation = safety net for Type 2
+- (-) Slightly more verbose than a decorator for simple use cases (3 extra lines)
+- (-) If the developer forgets `await tx.commit()`, the transaction is silently lost
 
 ---
 
-## ADR-005: Tipos de dato entre capas — Approach Mixto
+## ADR-004: Exception Handling — Hierarchy + Decorators + HTTP Handler
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-asyncpg retorna `Record` objects. Sin conversión, todo es `record["field"]` — sin autocomplete, sin tipos, typos explotan en runtime. Pero convertir TODO a Pydantic o dataclass tiene costo innecesario para datos que solo se pasan sin procesarlos.
+**Context:**
+Without an error strategy, each developer puts try/catch wherever they see fit. DB errors get exposed to the client (`IntegrityError`). Inconsistent responses (`{"error": "..."}` vs `{"message": "..."}` vs stack traces). Use cases and controllers full of try/catch that obscure business logic.
 
-**Opciones consideradas:**
+Domain exceptions do not contain HTTP status codes. The mapping from exception to status code lives exclusively in `exception/http_handler.py`. This allows the same exceptions to be used in non-HTTP contexts (SQS consumers, CLI, workers, gRPC) without coupling to HTTP.
 
-| Opción | Descripción |
+**Options considered:**
+
+| Option | Description |
 |---|---|
-| A) Pydantic everywhere | Todo dato se convierte a Pydantic model |
-| B) Dict everywhere | Todo queda como Record/dict |
-| C) Mixto | Pydantic en fronteras HTTP, dataclass para dominio, dict para pass-through |
+| A) Try/catch in every layer | Each layer catches and re-throws its errors |
+| B) Single global handler | One catch-all in FastAPI translates everything |
+| C) Hierarchy + Decorators + Handler | Typed exceptions + decorators in repos/services + HTTP handler |
 
-**Por qué NO las otras:**
-- **A) Pydantic everywhere:** Overhead de validación en cada conversión. Un JOIN que retorna 20 columnas necesita un model con 20 campos solo para pasar datos al response. Pydantic v2 es rápido, pero no gratis — y la mayoría de esos campos nunca se acceden en el use case.
-- **B) Dict everywhere:** El use case accede a `loan["status"]` — sin autocomplete, sin tipos, `loan["statos"]` falla en runtime. Para datos que el use case necesita manipular, esto es inaceptable.
+**Why NOT the others:**
+- **A) Try/catch in every layer:** Controller has try/catch, use case has try/catch, repo has try/catch. 3 levels of catch for a single error. The code becomes unreadable. If someone forgets a catch, the error bubbles up untranslated.
+- **B) Single global handler:** Works, but the handler needs `isinstance` checks to know what type of error it is. If the repo throws `IntegrityError`, the global handler needs to know about SQLAlchemy — direct coupling between the HTTP handler and the DB library.
 
-**Decisión:** Opción C — Approach mixto.
+**Decision:** Option C — Typed hierarchy (without status codes) + Infrastructure decorators + HTTP Handler with `STATUS_MAP`.
 
-**Justificación:**
+**Justification:**
+- **`AppException` only has `message`**, no `status_code`. Exceptions are protocol-agnostic
+- **`http_handler.py`** uses `DOMAIN_STATUS_MAP` and `INFRA_STATUS_MAP` (dicts) to translate exception type → HTTP status code. Each future protocol (gRPC, CLI, SQS) can have its own handler without touching the exceptions
+- **Decorators (`@handle_db_errors`, `@handle_external_errors`)** in repos/services translate library errors to the app's hierarchy. The repo can do a targeted try/catch for errors with business meaning (e.g.: `IntegrityError → AlreadyExistsError`). Everything else → decorator → `DatabaseException`
+- **Use cases and controllers:** ZERO try/catch. They only throw guards (`if not entity: raise EntityNotFoundError`). They read like a book
+- **HTTP Handler:** Catches by category (`DomainException`, `DatabaseException`, `ExternalServiceException`, `Exception`). One handler per category, zero `isinstance`. The `STATUS_MAP` centralizes the mapping
 
-| Dato | Tipo | Dónde vive | Por qué |
+**Consequences:**
+- (+) Clean use cases and controllers — business logic only
+- (+) Consistent HTTP responses always
+- (+) Exceptions are reusable across any protocol (HTTP, gRPC, CLI, SQS workers)
+- (+) Infrastructure errors are never exposed to the client (generic 503 for DB, 502/504 for external)
+- (-) The hierarchy must be kept coherent — if someone throws `Exception` directly, it falls to the catch-all (500)
+- (-) The decorators catch `AppException` and let it pass through — if someone doesn't understand this, it can be confusing
+- (-) Adding a new exception requires two steps: create the class + add it to the HTTP handler's `STATUS_MAP`
+
+---
+
+## ADR-005: Data types between layers — Mixed Approach
+
+**Status:** Accepted
+
+**Context:**
+Repositories return data from the DB. Without conversion, everything remains as ORM objects — no separation between infrastructure and domain. But converting EVERYTHING to Pydantic or dataclass has unnecessary cost for data that is just passed through without processing.
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) Pydantic everywhere | All data is converted to Pydantic model |
+| B) Dict everywhere | Everything stays as Record/dict |
+| C) Mixed | Pydantic at HTTP boundaries, dataclass for domain, dict for pass-through |
+
+**Why NOT the others:**
+- **A) Pydantic everywhere:** Validation overhead on every conversion. A JOIN that returns 20 columns needs a model with 20 fields just to pass data to the response. Pydantic v2 is fast, but not free — and most of those fields are never accessed in the use case.
+- **B) Dict everywhere:** The use case accesses `loan["status"]` — no autocomplete, no types, `loan["statos"]` fails at runtime. For data that the use case needs to manipulate, this is unacceptable.
+
+**Decision:** Option C — Mixed approach.
+
+**Justification:**
+
+| Data | Type | Where it lives | Why |
 |---|---|---|---|
-| Request HTTP | Pydantic | `schema/` | Validación de entrada automática |
-| Entidad de dominio | dataclass + `from_record` | `entity/` | Autocomplete, tipos, lógica futura |
-| Dato de paso (JOINs) | dict | — | Sin conversión innecesaria |
-| Response HTTP | Pydantic | `schema/` | Serialización controlada |
+| HTTP Request | Pydantic | `schema/` | Automatic input validation |
+| ORM Model | SQLAlchemy Model | `model/` | Table mapping, `to_entity()` for conversion |
+| Domain Entity | dataclass | `entity/` | Autocomplete, types, future logic |
+| Pass-through data (JOINs) | dict | — | No unnecessary conversion |
+| HTTP Response | Pydantic | `schema/` | Controlled serialization |
 
-**Regla simple:** ¿El use case accede a campos del dato para hacer lógica? → dataclass. ¿Solo lo pasa al response? → dict.
+**Simple rule:** Does the use case access fields of the data to perform logic? → dataclass (via `model.to_entity()`). Does it just pass it to the response? → dict.
 
-**Consecuencias:**
-- (+) Autocomplete y tipos donde importa (use cases)
-- (+) Sin overhead para datos que solo se pasan
-- (+) `from_record` centraliza la conversión Record→Entity
-- (-) Dos tipos de retorno en repos (dataclass para write, dict para query) — el developer debe saber cuál usar
-- (-) `schema/` y `entity/` pueden confundirse si no se documenta bien la diferencia
-
----
-
-## ADR-006: Migraciones con Alembic + Raw SQL (sin ORM)
-
-**Status:** Aceptado
-
-**Contexto:**
-No usamos ORM — los repos escriben SQL directo. Pero necesitamos versionar cambios de schema de BD con orden garantizado, upgrade/downgrade, y historial en git.
-
-**Opciones consideradas:**
-
-| Opción | Descripción |
-|---|---|
-| A) SQLAlchemy ORM + autogenerate | Alembic con modelos SQLAlchemy, migraciones auto-generadas |
-| B) Alembic + raw SQL | Alembic como runner, SQL escrito a mano |
-| C) Custom scripts | Scripts SQL numerados, ejecutados manualmente |
-
-**Por qué NO las otras:**
-- **A) SQLAlchemy ORM + autogenerate:** Introduciría un ORM que contradice la decisión de usar raw queries. Tendríamos models de SQLAlchemy que no se usan para queries pero sí para migraciones — confusión. El equipo tendría que mantener dos fuentes de verdad (models ORM + raw queries).
-- **C) Custom scripts:** Sin orden garantizado, sin tracking de qué migración ya corrió, sin downgrade. Re-inventar lo que Alembic ya resuelve.
-
-**Decisión:** Opción B — Alembic como runner de migraciones con SQL puro.
-
-**Justificación:**
-- Alembic provee: versionamiento, orden de ejecución, upgrade/downgrade, historial en git, tabla `alembic_version` para tracking
-- El developer escribe `op.execute("CREATE TABLE ...")` — SQL puro, sin abstracciones
-- Consistente con la filosofía de raw queries: el equipo controla el SQL exacto
-- No requiere SQLAlchemy models — solo el runner de Alembic
-
-**Consecuencias:**
-- (+) Control total sobre el SQL de las migraciones
-- (+) Sin duplicación de schema (no hay models ORM paralelos)
-- (+) El equipo solo necesita saber SQL, no SQLAlchemy
-- (-) Sin auto-generación: el developer debe escribir upgrade() Y downgrade() manualmente
-- (-) Sin detección automática de cambios olvidados — si cambias una query pero no creas migración, falla en runtime
-- (-) El flujo requiere disciplina: migración + entity + port + query deben commitearse juntos
+**Consequences:**
+- (+) Autocomplete and types where they matter (use cases)
+- (+) No overhead for data that is just passed through
+- (+) `model.to_entity()` centralizes the Model→Entity conversion in the ORM model
+- (-) Two return types in repos (dataclass for write, dict for query) — the developer must know which to use
+- (-) `schema/`, `model/` and `entity/` are 3 layers — clear distinction: model=DB, entity=domain, schema=HTTP
 
 ---
 
-## ADR-007: CQRS Lite — Separación de repos de lectura y escritura
+## ADR-006: SQLAlchemy ORM + Alembic autogenerate
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Dijimos "1 repo = 1 tabla". Pero cuando un use case necesita datos de varias tablas (ej: préstamo + datos del usuario), caes en N+1 queries: 1 query para loans + N queries para cada user. 100 loans = 101 queries. La solución es un JOIN, pero un JOIN cruza tablas — viola "1 repo = 1 tabla".
+**Context:**
+We need to access PostgreSQL and version schema changes. The decision between ORM and raw queries affects the entire data layer, migrations, and the team's mental model. We want a single source of truth for the DB schema that serves both for queries and for automatic migrations.
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) JOINs en write repos | Permitir JOINs en los repos existentes |
-| B) Repos de lectura separados | `LoanRepository` (write, 1 tabla) + `LoanQueryRepository` (read, JOINs) |
-| C) CQRS completo | 2 pools de BD (primary + replica), event sourcing |
+| A) Raw queries with asyncpg | Direct SQL, positional parameters ($1, $2), Alembic with manual `op.execute()` |
+| B) SQLAlchemy Core (query builder) | Query builder without ORM, no mapped models |
+| C) Full SQLAlchemy ORM | Mapped models, session management, query builder, Alembic autogenerate |
 
-**Por qué NO las otras:**
-- **A) JOINs en write repos:** Mezcla responsabilidades. Un `LoanRepository` con CRUD + JOINs complejos crece descontroladamente. No prepara para escalamiento futuro.
-- **C) CQRS completo:** Requiere 2 nodos de BD (primary + replica), event sourcing o change data capture, eventual consistency handling. Complejidad excesiva para el estado actual. No tenemos réplica de BD hoy.
+**Why NOT the others:**
+- **A) Raw queries with asyncpg:** The schema ends up scattered across 3 places: SQL migrations, queries in repos, and conversions in entities. Each table change requires touching all 3. Without autogenerate, migrations are manual. SQL errors are only detected at runtime.
+- **B) SQLAlchemy Core:** Solves the query builder but doesn't give mapped models. Without `to_entity()` on the model, conversion remains scattered. No autogenerate (requires ORM models for that).
 
-**Decisión:** Opción B — CQRS lite (separación a nivel de código).
+**Decision:** Option C — Full SQLAlchemy ORM with mapped models, `async_sessionmaker`, and Alembic autogenerate.
 
-**Justificación:**
-- **Hoy:** Ambos repos (`LoanRepository` y `LoanQueryRepository`) usan `get_current_connection()` y el mismo pool. La separación es SOLO de código
-- **Futuro:** El día que pongan una réplica de BD:
-  1. Se crea un segundo pool apuntando a la replica
-  2. `LoanQueryRepository` cambia a `get_read_connection()`
-  3. No se tocan use cases ni controllers
-- **Claridad:** Write repos son CRUD puros (1 tabla, fácil de entender). Query repos son consultas complejas (JOINs, agregaciones, dashboards)
+**Justification:**
 
-**Consecuencias:**
-- (+) Elimina N+1 queries con JOINs en query repos
-- (+) Write repos se mantienen simples (1 clase = 1 tabla)
-- (+) Preparado para réplica de BD sin refactor
-- (+) Use cases declaran qué tipo de datos necesitan (write port vs query port)
-- (-) Más clases (2 repos por entidad en vez de 1)
-- (-) El developer debe decidir si un nuevo query va en write repo o query repo
-- (-) Sin réplica real, la separación es "solo cosmética" hoy — el beneficio futuro es especulativo
+The `model/` layer is the **single source of truth** for the schema:
+
+| Aspect | How it works |
+|---|---|
+| Queries in repos | `select(UserModel).where(UserModel.id == id)` — typed, errors at import |
+| Migrations | `alembic revision --autogenerate` from models — detects changes automatically |
+| Model→Entity conversion | `model.to_entity()` on the ORM model — centralized |
+| Engine + session | `create_async_engine()` + `async_sessionmaker()` with asyncpg as driver |
+| Creates | `session.add(model)` + `session.flush()` — flush in repo, commit in use case |
+| Conditional updates | `update(LoanModel).where(...).values(...).returning(LoanModel)` — native RETURNING |
+| Constraint errors | `sqlalchemy.exc.IntegrityError` → `AlreadyExistsError` in the repo |
+
+**Key design decisions:**
+
+1. **`expire_on_commit=False`** in sessionmaker — without this, accessing attributes after commit throws `MissingGreenlet`
+2. **`session.flush()`** in repos (not commit) — the use case controls the commit via `transaction_context`
+3. **`server_default=text("gen_random_uuid()")`** for UUIDs — the server generates IDs, not Python
+4. **Entities remain as pure dataclasses** — `model/` and `entity/` are separate layers, repos convert model→entity
+5. **`update().returning(LoanModel)`** — SQLAlchemy 2.0+ with PostgreSQL supports RETURNING in ORM
+
+**File structure:**
+
+```
+model/
+├── __init__.py          # Exports Base + all models (for autogenerate)
+├── base.py              # DeclarativeBase
+├── user_model.py        # UserModel + to_entity()
+└── loan_model.py        # LoanModel + to_entity()
+```
+
+**Consequences:**
+- (+) Single source of truth for the schema: `model/`
+- (+) Autogenerated migrations — detects changes automatically
+- (+) Typed queries — column errors are detected at import, not at runtime
+- (+) asyncpg remains the driver (SQLAlchemy uses it internally) — same performance
+- (-) Extra layer of ORM models (`model/`) in addition to entities (`entity/`)
+- (-) The team needs to learn SQLAlchemy 2.0 query syntax
+- (-) Session management (flush vs commit, expire_on_commit) has gotchas that need to be documented
 
 ---
 
-## ADR-008: Testing — Unit para lógica + Integration para datos
+## ADR-007: CQRS Lite — Separation of read and write repos
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Todo es singleton. Los repos usan `get_current_connection()` de contextvars. No puedes hacer unit test de un repo sin BD real porque no hay nada que mockear — el SQL es la lógica. Pero para use cases y controllers, un mock del repo basta.
+**Context:**
+We said "1 repo = 1 table". But when a use case needs data from multiple tables (e.g.: loan + user data), you fall into N+1 queries: 1 query for loans + N queries for each user. 100 loans = 101 queries. The solution is a JOIN, but a JOIN crosses tables — it violates "1 repo = 1 table".
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) Todo unit test | Mockear conexión, cursor, fetchrow — probar que "llama a fetchrow con estos params" |
-| B) Todo integration test | BD real para todo, incluyendo use cases y controllers |
-| C) Mixto | Unit tests para controller/use case (mocks), integration para repo/service (BD real) |
+| A) JOINs in write repos | Allow JOINs in the existing repos |
+| B) Separate read repos | `LoanRepository` (write, 1 table) + `LoanQueryRepository` (read, JOINs) |
+| C) Full CQRS | 2 DB pools (primary + replica), event sourcing |
 
-**Por qué NO las otras:**
-- **A) Todo unit test:** Mockear `conn.fetchrow()` solo prueba que escribiste el mock correctamente. Un typo en el SQL pasa todos los unit tests y falla en producción. Los decorators (`@handle_db_errors`) nunca se ejercitan con errores reales.
-- **B) Todo integration test:** Lento. Requiere BD levantada para correr cualquier test. Un test de "si el user no existe, lanza error" no necesita BD — es lógica pura. CI se vuelve más lento y frágil.
+**Why NOT the others:**
+- **A) JOINs in write repos:** Mixes responsibilities. A `LoanRepository` with CRUD + complex JOINs grows uncontrollably. Doesn't prepare for future scaling.
+- **C) Full CQRS:** Requires 2 DB nodes (primary + replica), event sourcing or change data capture, eventual consistency handling. Excessive complexity for the current state. We don't have a DB replica today.
 
-**Decisión:** Opción C — Mixto con coverage combinado.
+**Decision:** Option B — CQRS lite (separation at the code level).
 
-**Justificación:**
+**Justification:**
+- **Today:** Both repos (`LoanRepository` and `LoanQueryRepository`) use `get_current_session()` and the same pool. The separation is code-level ONLY
+- **Future:** The day a DB replica is added:
+  1. A second pool pointing to the replica is created
+  2. `LoanQueryRepository` switches to `get_read_session()`
+  3. Use cases and controllers are not touched
+- **Clarity:** Write repos are pure CRUD (1 table, easy to understand). Query repos are complex queries (JOINs, aggregations, dashboards)
 
-| Capa | Tipo de test | Qué necesita |
+**Consequences:**
+- (+) Eliminates N+1 queries with JOINs in query repos
+- (+) Write repos stay simple (1 class = 1 table)
+- (+) Ready for DB replica without refactoring
+- (+) Use cases declare what type of data they need (write port vs query port)
+- (-) More classes (2 repos per entity instead of 1)
+- (-) The developer must decide if a new query goes in the write repo or query repo
+- (-) Without a real replica, the separation is "cosmetic only" today — the future benefit is speculative
+
+---
+
+## ADR-008: Testing — Unit for logic + Integration for data
+
+**Status:** Accepted
+
+**Context:**
+Everything is a singleton. Repos use `get_current_session()` from contextvars. You can't unit test a repo without a real DB because the ORM queries are the logic. But for use cases and controllers, a repo mock is enough.
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) All unit tests | Mock session, execute, scalars — prove that "it calls execute with these params" |
+| B) All integration tests | Real DB for everything, including use cases and controllers |
+| C) Mixed | Unit tests for controller/use case (mocks), integration for repo/service (real DB) |
+
+**Why NOT the others:**
+- **A) All unit tests:** Mocking `session.execute()` only proves that you wrote the mock correctly. A typo in a column name passes all unit tests and fails in production. The decorators (`@handle_db_errors`) are never exercised with real errors.
+- **B) All integration tests:** Slow. Requires the DB to be running for any test. A test for "if the user doesn't exist, throw an error" doesn't need a DB — it's pure logic. CI becomes slower and more fragile.
+
+**Decision:** Option C — Mixed with combined coverage.
+
+**Justification:**
+
+| Layer | Test type | What it needs |
 |---|---|---|
-| Controller | Unit | Mock del use case (constructor injection) |
-| Use Case | Unit | Mock del repo/factory (constructor injection) |
-| Repository | Integration | BD real + `connection_context` + rollback |
-| Service | Integration | Mock HTTP (`httpx_mock`), no mock BD |
-| Decorators | Integration | BD real (para errores reales de asyncpg) |
+| Controller | Unit | Mock of the use case (constructor injection) |
+| Use Case | Unit | Mock of the repo/factory (constructor injection) |
+| Repository | Integration | Real DB + `session_context` + rollback |
+| Service | Integration | Mock HTTP (`httpx_mock`), not mock DB |
+| Decorators | Integration | Real DB (for real SQLAlchemy errors) |
 
-- **Unit tests:** Rápidos (~ms), sin BD. Prueban lógica de negocio: guardas, orquestación, delegación
-- **Integration tests:** Con BD real. Prueban SQL, conversiones, constraints, decorators. Fixture con `connection_context` + rollback para aislamiento
-- **Coverage combinado:** `pytest tests/unit --cov` + `pytest tests/integration --cov --cov-append` + `coverage report`
+- **Unit tests:** Fast (~ms), no DB. Test business logic: guards, orchestration, delegation
+- **Integration tests:** With real DB. Test ORM queries, conversions, constraints, decorators. Fixture with `session_context` + rollback for isolation
+- **Combined coverage:** `pytest tests/unit --cov` + `pytest tests/integration --cov --cov-append` + `coverage report`
 
-**Consecuencias:**
-- (+) Unit tests son rápidos — se pueden correr en cada save
-- (+) Integration tests prueban lo que realmente importa en repos: el SQL
-- (+) Coverage combinado refleja cobertura real del código
-- (-) Necesitas una BD de test (Docker Compose)
-- (-) Para use cases con `@transactional`, unit tests usan `__wrapped__` para bypassear el decorator. Para use cases con `transaction_context`, se patchea el context manager
-- (-) Dos suites de test = más configuración de CI
-
----
-
-## ADR-009: Interfaces con Python Protocols (typing.Protocol)
-
-**Status:** Aceptado
-
-**Contexto:**
-En Clean Architecture, las capas internas (use case) no deben depender de las externas (repository concreto). El use case debe depender de una abstracción. Python ofrece varias formas de definir contratos.
-
-**Opciones consideradas:**
-
-| Opción | Descripción |
-|---|---|
-| A) Sin interfaces | El use case recibe el repo concreto. DI por constructor sin abstracción |
-| B) ABC (Abstract Base Class) | `class LoanRepoABC(ABC)` con `@abstractmethod`. El repo hereda |
-| C) Protocol (duck typing) | `class LoanRepositoryPort(Protocol)`. El repo cumple por firma, sin herencia |
-
-**Por qué NO las otras:**
-- **A) Sin interfaces:** El use case importa directamente `LoanRepository`. Si quieres cambiar la implementación, tocas el use case. Si quieres testear, el mock debe imitar la clase concreta. No hay Dependency Inversion.
-- **B) ABC:** Requiere herencia (`class LoanRepository(LoanRepoABC)`). Si agregas un método al ABC, TODOS los repos concretos explotan hasta que lo implementen. Más rígido. Python no es Java — la herencia obligatoria se siente antinatural.
-
-**Decisión:** Opción C — Python Protocols (duck typing estructural).
-
-**Justificación:**
-- **Sin herencia:** `LoanRepository` no hereda de nada. Cumple el Protocol simplemente por tener los mismos métodos con las mismas firmas
-- **Verificable estáticamente:** `mypy --strict` detecta si un repo no cumple un Protocol antes de correr
-- **DI pura:** app.py instancia el concreto y lo pasa al use case. El use case solo ve el Protocol. Si cambias la implementación, solo tocas app.py
-- **Pythonic:** Protocols son el equivalente Python de interfaces — duck typing con verificación estática
-
-**Consecuencias:**
-- (+) Use cases desacoplados de implementaciones concretas
-- (+) Tests triviales: cualquier mock que tenga los mismos métodos cumple el Protocol
-- (+) mypy/pyright detectan incompatibilidades antes de runtime
-- (-) Sin mypy, los errores de Protocol son invisibles — funciona igual que sin interfaces
-- (-) Una capa más de archivos (`port/`) que mantener
-- (-) Los Protocols deben actualizarse cuando cambia la firma de un repo
+**Consequences:**
+- (+) Unit tests are fast — can be run on every save
+- (+) Integration tests test what really matters in repos: the ORM queries
+- (+) Combined coverage reflects real code coverage
+- (-) You need a test DB (Docker Compose)
+- (-) For use cases with `transaction_context`, the context manager is patched in unit tests
+- (-) Two test suites = more CI configuration
 
 ---
 
-## ADR-010: Modelo de Entidad — Anémico progresivo
+## ADR-009: Interfaces with Python Protocols (typing.Protocol)
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Clean Architecture sugiere entidades ricas con lógica de negocio. Pero hoy las entidades son simples contenedores de datos (dataclass). ¿Agregamos lógica de negocio a las entidades ahora o después?
+**Context:**
+In Clean Architecture, inner layers (use case) must not depend on outer layers (concrete repository). The use case must depend on an abstraction. Python offers several ways to define contracts.
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) Entidades ricas desde el inicio | `loan.approve()`, `loan.can_be_disbursed()`, validaciones en la entidad |
-| B) Anémico permanente | Solo datos, toda la lógica en use cases, las entidades nunca cambian |
-| C) Anémico progresivo | Datos hoy. Lógica se agrega cuando se justifica |
+| A) No interfaces | The use case receives the concrete repo. DI by constructor without abstraction |
+| B) ABC (Abstract Base Class) | `class LoanRepoABC(ABC)` with `@abstractmethod`. The repo inherits |
+| C) Protocol (duck typing) | `class LoanRepositoryPort(Protocol)`. The repo fulfills it by signature, without inheritance |
 
-**Por qué NO las otras:**
-- **A) Entidades ricas desde el inicio:** Hoy no tenemos suficiente lógica de negocio para justificarlo. Un `loan.approve()` que solo hace `self.status = "approved"` no agrega valor sobre `update_status_if` en el repo. Estaríamos creando abstracciones para lógica que no existe todavía.
-- **B) Anémico permanente:** Si la lógica de negocio crece (validaciones de transición de estado, reglas de negocio complejas), todo queda en los use cases. Los use cases crecen y se vuelven difíciles de testear.
+**Why NOT the others:**
+- **A) No interfaces:** The use case directly imports `LoanRepository`. If you want to change the implementation, you touch the use case. If you want to test, the mock must mimic the concrete class. There is no Dependency Inversion.
+- **B) ABC:** Requires inheritance (`class LoanRepository(LoanRepoABC)`). If you add a method to the ABC, ALL concrete repos break until they implement it. More rigid. Python is not Java — mandatory inheritance feels unnatural.
 
-**Decisión:** Opción C — Anémico progresivo.
+**Decision:** Option C — Python Protocols (structural duck typing).
 
-**Justificación:**
-- **Hoy:** Dataclass con datos + `from_record()`. Si un `ensure_exists` en el use case basta, no mover esa lógica a la entidad
-- **Futuro:** Cuando la lógica de negocio justifique (ej: `loan.can_be_disbursed()` involucra 3+ condiciones), se agrega a la entidad
-- **YAGNI:** No crear abstracciones para código que no existe
-- **Orgánico:** Las entidades crecen naturalmente cuando el dominio lo requiere
+**Justification:**
+- **No inheritance:** `LoanRepository` doesn't inherit from anything. It fulfills the Protocol simply by having the same methods with the same signatures
+- **Statically verifiable:** `mypy --strict` detects if a repo doesn't fulfill a Protocol before running
+- **Pure DI:** app.py instantiates the concrete and passes it to the use case. The use case only sees the Protocol. If you change the implementation, you only touch app.py
+- **Pythonic:** Protocols are the Python equivalent of interfaces — duck typing with static verification
 
-**Consecuencias:**
-- (+) Simplicidad hoy — las entidades son triviales de entender
-- (+) Sin premature abstraction — solo se agrega lógica cuando se necesita
-- (+) Compatible con entidades ricas futuras — el path está preparado
-- (-) Hoy no estamos 100% Clean Architecture (las entidades son anémicas)
-- (-) Requiere disciplina: el equipo debe reconocer cuándo mover lógica del use case a la entidad
+**Consequences:**
+- (+) Use cases decoupled from concrete implementations
+- (+) Trivial tests: any mock that has the same methods fulfills the Protocol
+- (+) mypy/pyright detect incompatibilities before runtime
+- (-) Without mypy, Protocol errors are invisible — works the same as without interfaces
+- (-) One more layer of files (`port/`) to maintain
+- (-) Protocols must be updated when a repo's signature changes
 
 ---
 
-## ADR-011: Raw Queries vs ORM
+## ADR-010: Entity Model — Entities as experts on themselves
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Necesitamos acceder a PostgreSQL. La decisión entre ORM y raw queries afecta toda la capa de datos, las migraciones, y el modelo mental del equipo.
+**Context:**
+Entities need to encapsulate the business rules that are inherent to themselves. The question is: what logic belongs to the entity and what to the use case?
 
-**Opciones consideradas:**
+**Philosophy:** The entity is an expert on itself, not on the system. If the rule "only approved loans can be disbursed" changes, it changes in the entity — not in N use cases. But the entity doesn't know how to save itself, doesn't know how to call providers, doesn't know how to look up other data.
 
-| Opción | Descripción |
+**Options considered:**
+
+| Option | Description |
 |---|---|
-| A) SQLAlchemy ORM | Models, relationships, session management, query builder |
-| B) Raw queries con asyncpg | SQL directo, parámetros posicionales ($1, $2) |
-| C) Query builder (SQLAlchemy Core) | Builder de queries sin ORM, sin models |
+| A) Full rich entities | Entities handle persistence, transitions, and coordination |
+| B) Permanently anemic | Data only, all logic in use cases |
+| C) Entities as experts on themselves | The entity encapsulates rules about itself; the use case orchestrates the system |
 
-**Por qué NO las otras:**
-- **A) SQLAlchemy ORM:** Genera SQL que el developer no controla. Lazy loading puede crear N+1 invisibles. Session management agrega complejidad (flush, commit, expire). El equipo necesita aprender SQLAlchemy además de SQL. Debug de queries generadas es más difícil que debug de SQL que tú escribiste.
-- **C) Query builder:** Más portable que raw SQL, pero agrega una abstracción sobre SQL que el equipo ya conoce. No vamos a cambiar de PostgreSQL. El beneficio de portabilidad no justifica la abstracción.
+**Why NOT the others:**
+- **A) Full rich entities:** The entity ends up knowing about repos, services, and transactions. Violates Single Responsibility. Makes testing difficult (you need to mock infrastructure inside the entity).
+- **B) Permanently anemic:** If `loan.status != "approved"` is validated in 3 different use cases, any change to that rule requires touching all 3. The rule belongs to the entity, not the system.
 
-**Decisión:** Opción B — Raw queries con asyncpg.
+**Decision:** Option C — Entities as experts on themselves.
 
-**Justificación:**
-- **Control total:** El developer escribe el SQL exacto que se ejecuta. Sin magia, sin queries invisibles
-- **Performance:** asyncpg es el driver PostgreSQL más rápido en Python. Sin overhead de ORM
-- **El equipo sabe SQL:** No necesitan aprender una abstracción sobre algo que ya conocen
-- **Debug directo:** El SQL que ves en el código es el SQL que se ejecuta. Sin traducciones
+**Justification:**
 
-**Consecuencias:**
-- (+) Performance óptima — asyncpg con prepared statements
-- (+) Sin sorpresas — el SQL que escribes es el que corre
-- (+) El equipo solo necesita saber SQL + asyncpg
-- (-) Sin migraciones automáticas (resuelto con ADR-006: Alembic + raw SQL)
-- (-) Sin lazy loading — JOINs explícitos (resuelto con ADR-007: CQRS Lite)
-- (-) Sin portabilidad entre BDs — atados a PostgreSQL (aceptable: no planeamos cambiar)
-- (-) SQL repetido en repos — sin abstracciones como `.filter()` o `.select()`
+| Responsibility | Where it lives | Example |
+|---|---|---|
+| Can I be evaluated? | **Entity** | `loan.ensure_can_evaluate()` |
+| Can I be disbursed? | **Entity** | `loan.ensure_can_disburse()` |
+| What is my result given a score? | **Entity** | `loan.determine_evaluation_status(score, min)` |
+| Does it exist in the DB? | **Use case** | `self.ensure_exists(loan, msg)` |
+| Did the concurrent update take effect? | **Use case** | `self.ensure_was_updated(result)` |
+| In what order do I call repos and services? | **Use case** | transaction orchestration |
+
+- **What goes in the entity:** Validations of own state, transitions, decisions based on its own attributes
+- **What does NOT go in the entity:** Persistence, external calls, looking up other data, orchestration
+- **User has no methods** because today it has no business rules of its own — if it did, they would be added there
+- Example: `loan.ensure_can_disburse()` in the entity vs `self.ensure_approved()` in the use case — the rule belongs to the loan, not the use case
+
+**Consequences:**
+- (+) Business rules inherent to the entity live in a single place — DRY
+- (+) Use cases read as pure orchestration: find, validate, transact
+- (+) Testable: the entity is tested without mocks (it's a dataclass with pure methods)
+- (+) Entities grow organically when the domain requires it
+- (-) Requires judgment: distinguishing "entity rule" vs "system rule"
+- (-) Entities import domain exceptions — acceptable because exceptions are part of the domain
 
 ---
 
-## ADR-012: Separación de Schema (HTTP DTOs) vs Entity (Dominio)
+## ADR-011: Separation of Schema (HTTP DTOs) vs Entity (Domain)
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Inicialmente teníamos `schema/` con Pydantic models que servían tanto para HTTP validation como para representar entidades de dominio. Esto mezclaba concerns: un `Loan` model tenía campos de request (`provider`), campos de response (`id`, `status`), y campos de dominio (`score`).
+**Context:**
+Initially we had `schema/` with Pydantic models that served both for HTTP validation and for representing domain entities. This mixed concerns: a `Loan` model had request fields (`provider`), response fields (`id`, `status`), and domain fields (`score`).
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) Un modelo para todo | Pydantic model usado en HTTP y en use cases |
-| B) Separar schema/ y entity/ | schema/ solo para HTTP DTOs, entity/ para dominio |
-| C) Pydantic para todo pero separado | Pydantic para HTTP y Pydantic para dominio (sin dataclass) |
+| A) One model for everything | Pydantic model used in HTTP and in use cases |
+| B) Separate schema/ and entity/ | schema/ only for HTTP DTOs, entity/ for domain |
+| C) Pydantic for everything but separated | Pydantic for HTTP and Pydantic for domain (without dataclass) |
 
-**Por qué NO las otras:**
-- **A) Un modelo para todo:** El model necesita campos opcionales para cubrir request, response Y dominio. `amount: float | None` porque el response no siempre lo incluye, pero el dominio siempre lo tiene. Confusión sobre qué campos son requeridos en qué contexto.
-- **C) Pydantic para todo:** Validación de Pydantic tiene costo. En el dominio no necesitamos re-validar datos que ya vienen de la BD. Además, Pydantic models son immutables por default — si la entidad necesita mutarse (futuro: entidades ricas), es friction innecesaria.
+**Why NOT the others:**
+- **A) One model for everything:** The model needs optional fields to cover request, response AND domain. `amount: float | None` because the response doesn't always include it, but the domain always has it. Confusion about which fields are required in which context.
+- **C) Pydantic for everything:** Pydantic validation has a cost. In the domain we don't need to re-validate data that already comes from the DB. Also, Pydantic models are immutable by default — if the entity needs to mutate (future: rich entities), that's unnecessary friction.
 
-**Decisión:** Opción B — `schema/` para HTTP DTOs (Pydantic), `entity/` para dominio (dataclass).
+**Decision:** Option B — `schema/` for HTTP DTOs (Pydantic), `entity/` for domain (dataclass).
 
-**Justificación:**
-- **schema/:** Pydantic BaseModel. Solo valida requests y serializa responses. Vive en la frontera HTTP
-- **entity/:** Python dataclass. Datos de dominio + `from_record()`. Usado dentro de use cases para autocomplete y tipos
-- **Separación clara:** HTTP concerns (validación, serialización) no contaminan el dominio. El dominio no conoce Pydantic
+**Justification:**
+- **schema/:** Pydantic BaseModel. Only validates requests and serializes responses. Lives at the HTTP boundary
+- **entity/:** Python dataclass. Pure domain data. Used inside use cases for autocomplete and types. Conversion from DB lives in `model.to_entity()`
+- **Clear separation:** HTTP concerns (validation, serialization) don't contaminate the domain. The domain doesn't know about Pydantic or SQLAlchemy
 
-**Consecuencias:**
-- (+) Cada capa tiene su tipo de dato apropiado
-- (+) Las entidades pueden crecer a entidades ricas sin restricciones de Pydantic
-- (+) Los schemas HTTP pueden cambiar sin afectar el dominio
-- (-) Más archivos (entity/ + schema/ en vez de solo schema/)
-- (-) Conversión necesaria: `asdict(entity)` → `Response(**asdict(entity))`. Costo mínimo
+**Consequences:**
+- (+) Each layer has its appropriate data type
+- (+) Entities can grow into rich entities without Pydantic constraints
+- (+) HTTP schemas can change without affecting the domain
+- (-) More files (entity/ + schema/ instead of just schema/)
+- (-) Conversion needed: `asdict(entity)` → `Response(**asdict(entity))`. Minimal cost
 
 ---
 
-## ADR-013: Dependency Injection — Constructor Manual en app.py
+## ADR-012: Dependency Injection — Manual Container + app.state + Depends()
 
-**Status:** Aceptado
+**Status:** Accepted
 
-**Contexto:**
-Cada clase necesita sus dependencias (repos, services, factories). Necesitamos un mecanismo de inyección que sea testeable y no acople las clases entre sí.
+**Context:**
+Each class needs its dependencies (repos, services, factories). We need an injection mechanism that is testable, doesn't couple classes to each other, and scales as the app grows.
 
-**Opciones consideradas:**
+**Options considered:**
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| A) FastAPI Depends para todo | Usar `Depends()` para inyectar repos, use cases, etc. |
-| B) Constructor injection + wiring manual en app.py | Cada clase recibe deps en `__init__`, app.py cablea todo |
+| A) FastAPI Depends for everything | Use `Depends()` to inject repos, use cases, etc. |
+| B) Constructor injection + wiring in app.py | Each class receives deps in `__init__`, all wiring in app.py |
 | C) DI Container library | python-inject, dependency-injector, etc. |
+| D) Manual container + app.state + Depends() | Wiring in `container.py`, singletons in `app.state`, injection via `Depends()` |
 
-**Por qué NO las otras:**
-- **A) FastAPI Depends para todo:** Acopla todo al framework. Los use cases no deberían conocer FastAPI. Además, `Depends()` crea instancias por request — queremos singletons para controllers, use cases y repos.
-- **C) DI Container library:** Agrega una dependencia y complejidad que no necesitamos. El wiring manual en app.py es ~30 líneas y es completamente explícito. No hay magia de auto-discovery ni decorators especiales.
+**Why NOT the others:**
+- **A) FastAPI Depends for everything:** Couples everything to the framework. Use cases shouldn't know about FastAPI. Also, `Depends()` creates instances per request — we want singletons for controllers, use cases, and repos.
+- **B) Wiring in app.py:** Works for small apps, but app.py grows linearly with each dependency. Endpoints as closures capture all local variables. Doesn't scale well.
+- **C) DI Container library:** Adds a dependency and complexity we don't need. No magic auto-discovery or special decorators.
 
-**Decisión:** Opción B — Constructor injection con wiring manual en app.py.
+**Decision:** Option D — Manual container (`dependencies/container.py`) + `app.state` + `Depends()` providers.
 
-**Justificación:**
-- **Explícito:** app.py es el único archivo donde se conocen las clases concretas. Puedes leerlo y ver exactamente qué recibe cada clase
-- **Testeable:** En tests, creas `UseCase(mock_repo)` — sin configurar containers ni overrides
-- **Sin magia:** No hay auto-wiring, no hay decorators de DI, no hay runtime reflection
-- **Singletons naturales:** Instancias una vez en app.py, reutilizas para siempre
+**Justification:**
 
-**Consecuencias:**
-- (+) Zero dependencias extra
-- (+) Tests triviales: `UseCase(AsyncMock())` y listo
-- (+) El developer ve todo el wiring en un solo archivo
-- (-) Si la app crece mucho, app.py puede volverse largo. Mitigation: separar en módulos de wiring si llega a 100+ líneas
-- (-) Sin auto-wiring: agregar un nuevo use case requiere 3 líneas en app.py (instanciar repo, instanciar use case, instanciar controller)
+The architecture separates 3 responsibilities:
 
----
-
-## ADR-014: Outbox Pattern para notificaciones fire-and-forget
-
-**Status:** Aceptado
-
-**Contexto:**
-Después de aprobar o dispersar un préstamo, necesitamos enviar una notificación al usuario (SMS, email, push). Si la llamada al servicio de notificación falla, ¿revertimos la dispersión? No — el dinero ya salió. Necesitamos un mecanismo que garantice que la notificación se envíe eventualmente, sin acoplar la transacción de BD al servicio externo.
-
-**Opciones consideradas:**
-
-| Opción | Descripción |
-|---|---|
-| A) Llamada directa | Llamar SQS/SMS directamente en el use case |
-| B) Saga pattern | Orquestador de pasos con compensaciones |
-| C) Outbox pattern | Guardar mensaje en tabla de BD dentro de la misma transacción. Worker envía después |
-
-**Por qué NO las otras:**
-- **A) Llamada directa:** Si la transacción de BD hace commit pero la llamada a SQS falla → dato guardado pero notificación perdida. Si la llamada a SQS tiene éxito pero la transacción falla → notificación enviada para un dato que no existe. No hay atomicidad.
-- **B) Saga pattern:** Complejidad excesiva para notificaciones. Sagas son para operaciones distribuidas que necesitan compensación (ej: reserva de vuelo + hotel). Una notificación SMS no necesita compensación — si falla, se reintenta.
-
-**Decisión:** Opción C — Outbox pattern.
-
-**Justificación:**
-- **Atomicidad:** El mensaje se guarda en la tabla `outbox` dentro de la misma transacción que el cambio de BD. Si la transacción falla, el mensaje nunca se guardó → nunca se envía. Si la transacción tiene éxito, el mensaje está garantizado en la tabla
-- **Resiliencia:** Un worker lee mensajes pending y los envía. Si falla, reintenta. Después de N reintentos, mueve a `dead_letter` para revisión manual
-- **Desacoplado:** El use case no conoce SQS, SMS ni email — solo llama `outbox_repo.save("notification", payload)`
-
-**Consecuencias:**
-- (+) Garantía de que cada transacción exitosa genera su notificación
-- (+) Reintentos automáticos con dead letter para mensajes poison
-- (+) El use case no se acopla al mecanismo de envío
-- (-) Eventual consistency: la notificación no se envía en el mismo request — hay un delay (1-2 segundos típicamente)
-- (-) Requiere un worker corriendo (cron o proceso background)
-- (-) La tabla outbox crece — necesita limpieza periódica de mensajes `sent`
-
----
-
-## Resumen de decisiones
-
-| ADR | Decisión | Alternativa principal rechazada |
+| Responsibility | File | What it does |
 |---|---|---|
-| 001 | Full async | Sync con threads |
-| 002 | Context manager + contextvars + Depends | Middleware |
-| 003 | @transactional + transaction_context | Decorator único para todo |
-| 004 | Jerarquía + decorators + handler global | Try/catch en cada capa |
-| 005 | Mixto (Pydantic + dataclass + dict) | Pydantic everywhere |
-| 006 | Alembic + raw SQL | SQLAlchemy ORM + autogenerate |
-| 007 | CQRS Lite (write + query repos) | JOINs en write repos |
-| 008 | Unit (controller/UC) + Integration (repo) | Todo unit test con mocks |
-| 009 | Python Protocols | ABC / Sin interfaces |
-| 010 | Anémico progresivo | Entidades ricas desde inicio |
-| 011 | Raw queries con asyncpg | SQLAlchemy ORM |
-| 012 | schema/ (HTTP) + entity/ (dominio) | Un modelo para todo |
-| 013 | Constructor injection + app.py | DI Container library |
-| 014 | Outbox pattern | Llamada directa a SQS/SMS |
+| Wiring (building the graph) | `dependencies/container.py` | `build_container(config)` → instantiates everything in order, returns a `Container` frozen dataclass |
+| Storage (available singletons) | `app.state` | Lifespan saves controllers and database in `app.state` |
+| Injection (endpoints receive deps) | `dependencies/providers.py` | `Depends()` functions that extract from `app.state` |
+| Endpoints (HTTP) | `api/v1/*.py` | Module-level `APIRouter`, use `Depends(get_*_controller)` |
+| Composition root | `app.py` | `create_app()` — lifespan + exception handlers + include routers |
+
+**Flow:**
+1. `create_app(config)` → creates the app with lifespan
+2. Lifespan calls `build_container(config)` → builds the entire graph
+3. Lifespan saves singletons in `app.state`
+4. Endpoints use `Depends(get_user_controller)` → reads from `app.state`
+
+**Testable in 3 ways:**
+- **Unit tests:** `UseCase(AsyncMock())` — direct constructor injection
+- **Integration tests:** `create_app(test_config)` — full app with test config
+- **Targeted override:** `app.dependency_overrides[get_user_controller] = lambda: mock` — replaces a singleton
+
+**Consequences:**
+- (+) Zero extra dependencies — everything is native FastAPI
+- (+) Trivial tests: `UseCase(AsyncMock())` and done
+- (+) Wiring visible in a single file (`container.py`), app.py stays thin (~58 lines)
+- (+) Module-level endpoints (not closures), decoupled from the factory
+- (+) Adding a dependency = lines in `container.py` + provider function + `include_router`
+- (+) `create_app(config)` allows multiple instances with different config
+- (-) No auto-wiring: adding a new domain requires touching `container.py`, `providers.py`, and adding a router
+- (-) `app.state` is not typed — attribute errors are only detected at runtime
+
+---
+
+## ADR-013: Code style — PEP 8 + Ruff as linter
+
+**Status:** Accepted
+
+**Context:**
+Without a style standard, each developer writes differently: tabs vs spaces, unordered imports, 200-character lines. Code reviews fill up with cosmetic comments instead of discussing logic. We need an automated standard that the team doesn't have to memorize.
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) No linter | Each developer follows PEP 8 "by eye", corrected in code review |
+| B) Flake8 + isort + black | Classic stack: 3 separate tools with separate configs |
+| C) Ruff | A single linter/formatter that replaces flake8, isort, black, pyflakes, pycodestyle |
+
+**Why NOT the others:**
+- **A) No linter:** Code reviews become style discussions. "Put a space here", "that line is too long". Unproductive and subjective.
+- **B) Flake8 + isort + black:** Three tools with 3 configs (`setup.cfg`, `.isort.cfg`, `pyproject.toml`). Conflicts between them (black reformats, flake8 complains about black's format). Ruff does the same in a single tool, 10-100x faster.
+
+**Decision:** Option C — PEP 8 as standard, Ruff as enforcement.
+
+**Justification:**
+- **PEP 8** is the de facto Python standard. We don't invent our own rules
+- **Ruff** (`ruff check .`) executes in milliseconds — can be run in pre-commit, in CI, and on every editor save
+- **Minimal config** in `pyproject.toml`: `select = ["E", "W", "F", "ASYNC"]` — errors, warnings, pyflakes, and async rules
+- **Line length 88** (ruff/black default) — balance between readability and screen utilization
+
+**Rules enabled:**
+
+| Code | What it covers |
+|---|---|
+| `E` | PEP 8 style errors (indentation, whitespace, line length) |
+| `W` | PEP 8 warnings |
+| `F` | Pyflakes (unused imports, undefined variables, shadowing) |
+| `ASYNC` | Async-specific rules (missing await, blocking calls) |
+
+**Consequences:**
+- (+) Zero style discussions in code reviews
+- (+) A single tool replaces flake8 + isort + black
+- (+) Millisecond execution — doesn't slow down the developer
+- (-) Line length 88 can feel short for long ORM queries — solved with line breaks, not by disabling the rule
+
+---
+
+## ADR-014: Strict typing — mypy --strict (financial project)
+
+**Status:** Accepted
+
+**Scope:** This ADR is specific to this project. The strict typing decision is justified by the financial context of the system. Other projects may opt for gradual typing.
+
+**Context:**
+This is a financial system that handles loans, amounts, scores, and statuses. An `amount` that arrives as `str` instead of `float` is a bug that can approve a loan that should be rejected. A `score` that is `None` when `int` is expected is a silent error that changes a financial decision. In a generic CRUD system, gradual typing is acceptable. In a financial system, a type error can have real monetary impact.
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) No type checking | Optional type hints, documentation only. No static verification |
+| B) Basic mypy | `mypy .` without strict flags. Verifies what it can, ignores what's missing |
+| C) mypy --strict | All functions typed, no implicit `Any`, no ignored untyped imports |
+
+**Why NOT the others:**
+- **A) No type checking:** `loan.amount` could be `str`, `float`, `None`, or `Decimal` — depending on who sets it. In a financial system, this is unacceptable. A test can pass with `amount=1000` but fail in production with `amount="1000"` — and the error is discovered when money has already been disbursed.
+- **B) Basic mypy:** Verifies partially. A function without type hints passes without error. The developer can "escape" the type system simply by not adding hints. Creates false confidence — "mypy passes" but didn't verify the critical functions.
+
+**Decision:** Option C — `mypy --strict` in CI. Every parameter, return, and variable explicitly typed.
+
+**Justification:**
+- **`--strict` includes:** `--disallow-untyped-defs`, `--disallow-any-generics`, `--warn-return-any`, `--no-implicit-optional`, among others
+- **Errors at import, not at runtime:** `loan.amount + "10"` is detected before running. Not in production at 3am
+- **Protocols (ADR-009) benefit directly:** mypy verifies that the implementation fulfills the Protocol statically
+- **Complements Pydantic (ADR-011):** Pydantic validates at runtime (HTTP boundaries). mypy validates at development time (all internal code)
+
+**What it means for the developer:**
+```python
+# This does NOT pass mypy --strict
+def calculate_fee(amount, rate):
+    return amount * rate
+
+# This DOES pass
+def calculate_fee(amount: float, rate: float) -> float:
+    return amount * rate
+```
+
+**Consequences:**
+- (+) Type errors detected before commit — not in production
+- (+) Superior autocomplete in IDEs — everything is typed
+- (+) Implicit documentation — the signature says what it expects and what it returns
+- (+) Financial protection — a `None` where `float` is expected never reaches money calculations
+- (-) More verbose — every function needs hints, including internal helpers
+- (-) Libraries without stubs require `type: ignore` or custom stubs
+- (-) Learning curve with generics, Protocols, and overloads
+- (-) Slower CI (~seconds extra for `mypy --strict`)
+
+---
+
+## ADR-015: Dependency management — Poetry (financial project)
+
+**Status:** Accepted
+
+**Scope:** This ADR is specific to this project. The choice of Poetry over pip is justified by the financial context of the system, where exact build reproducibility is a requirement, not a preference.
+
+**Context:**
+A financial system that disburses loans cannot have different behavior between what the developer tested and what runs in production. If `httpx==0.28.0` was tested locally but `httpx==0.28.1` gets installed in production (because there was no lock file), a behavior change in the library can alter a response from a disbursement provider. In a generic CRUD, this is a minor bug. Here it can mean real money incorrectly disbursed.
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) pip + requirements.txt | `pip freeze > requirements.txt`. Manual lock. No dependency groups |
+| B) pip-tools | `pip-compile` generates `requirements.txt` from `requirements.in`. Deterministic lock |
+| C) Poetry | `pyproject.toml` for declaration + `poetry.lock` for lock. Dev/prod groups. Dependency resolver |
+| D) uv | New Rust-based package manager. Fast, pip-compatible. Own lock file |
+
+**Why NOT the others:**
+- **A) pip + requirements.txt:** `pip freeze` captures EVERYTHING in the environment — including transitive dependencies mixed with direct ones. Doesn't distinguish dev from prod (`pytest` gets installed in production). No conflict resolver: if two packages require incompatible versions of a third, `pip install` installs them anyway and fails at runtime.
+- **B) pip-tools:** Solves the lock, but maintains the `requirements.txt` model. Two files (`requirements.in` + `requirements.txt`) instead of the standard `pyproject.toml`. No native groups — you need a separate `requirements-dev.in`.
+- **D) uv:** Promising and fast, but young ecosystem. Lower adoption in enterprise teams. Installation speed isn't the bottleneck for this project — resolver reliability is.
+
+**Decision:** Option C (Poetry) — `pyproject.toml` + `poetry.lock`.
+
+**Justification:**
+
+| Aspect | How Poetry solves it |
+|---|---|
+| Deterministic lock | `poetry.lock` pins ALL versions (direct + transitive). `poetry install` installs exactly what was tested |
+| Dev/prod separation | `[tool.poetry.group.dev.dependencies]` — `pytest`, `ruff`, `mypy` never reach the production image |
+| Conflict resolver | If `fastapi` requires `pydantic>=2.0` and another package requires `pydantic<2.0`, Poetry fails at resolution — not at runtime |
+| PEP standard | `pyproject.toml` is the standard (PEP 621). Config for ruff, pytest, mypy — all in a single file |
+| Reproducibility | `poetry install --no-dev` in Docker = exactly what was tested in CI |
+
+**Usage rules:**
+- `poetry.lock` is **always committed** — it is the reproducibility guarantee
+- `poetry add <pkg>` to add dependencies (never manually edit `pyproject.toml` and run `poetry lock`)
+- `poetry add --group dev <pkg>` for development dependencies
+- In Docker: `poetry install --only main --no-interaction` — no dev deps, no prompts
+
+**Consequences:**
+- (+) Reproducible build — what passes CI is exactly what runs in production
+- (+) Version conflicts detected when adding dependencies, not when deploying
+- (+) A single configuration file (`pyproject.toml`) for the entire toolchain
+- (+) Clean dev/prod separation — lighter and more secure production image
+- (-) Poetry is slower than pip/uv for installation (~seconds extra in CI)
+- (-) The team needs to learn Poetry commands (`poetry add`, `poetry lock`, `poetry shell`)
+- (-) Dependency resolution can be slow with many packages — mitigable with `--no-update` in CI
+
+---

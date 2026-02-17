@@ -1,55 +1,82 @@
-from database.context import get_current_connection
+from sqlalchemy import select, update
+
+from database.context import get_current_session
 from entity.loan import Loan
 from exception.decorators import handle_db_errors
+from model.loan_model import LoanModel
 
 
 class LoanRepository:
 
     @handle_db_errors
     async def get_by_id(self, loan_id: str) -> Loan | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            "SELECT * FROM loans WHERE id = $1", loan_id
+        session = get_current_session()
+        result = await session.execute(
+            select(LoanModel).where(LoanModel.id == loan_id)
         )
-        return Loan.from_record(record) if record else None
+        model = result.scalars().first()
+        return model.to_entity() if model else None
 
     @handle_db_errors
     async def create(self, user_id: str, amount: float) -> Loan:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            """INSERT INTO loans (user_id, amount, status)
-               VALUES ($1, $2, 'pending')
-               RETURNING *""",
-            user_id, amount
-        )
-        return Loan.from_record(record)
+        session = get_current_session()
+        model = LoanModel(user_id=user_id, amount=amount, status="pending")
+        session.add(model)
+        await session.flush()
+        return model.to_entity()
 
     @handle_db_errors
-    async def update_status_if(self, loan_id: str, from_status: str, to_status: str) -> Loan | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            """UPDATE loans SET status = $1
-               WHERE id = $2 AND status = $3
-               RETURNING *""",
-            to_status, loan_id, from_status
+    async def update_status_if(
+        self, loan_id: str, from_status: str, to_status: str,
+    ) -> Loan | None:
+        session = get_current_session()
+        result = await session.execute(
+            update(LoanModel)
+            .where(LoanModel.id == loan_id, LoanModel.status == from_status)
+            .values(status=to_status)
+            .returning(LoanModel)
         )
-        return Loan.from_record(record) if record else None
+        model = result.scalars().first()
+        return model.to_entity() if model else None
 
     @handle_db_errors
     async def update_status(self, loan_id: str, status: str) -> None:
-        conn = get_current_connection()
-        await conn.execute(
-            "UPDATE loans SET status = $1 WHERE id = $2",
-            status, loan_id
+        session = get_current_session()
+        await session.execute(
+            update(LoanModel)
+            .where(LoanModel.id == loan_id)
+            .values(status=status)
         )
+        await session.flush()
 
     @handle_db_errors
-    async def save_evaluation(self, loan_id: str, score: int, status: str) -> Loan | None:
-        conn = get_current_connection()
-        record = await conn.fetchrow(
-            """UPDATE loans SET score = $1, status = $2
-               WHERE id = $3 AND status = 'scoring'
-               RETURNING *""",
-            score, status, loan_id
+    async def save_evaluation(
+        self, loan_id: str, score: int, status: str,
+    ) -> Loan | None:
+        session = get_current_session()
+        result = await session.execute(
+            update(LoanModel)
+            .where(LoanModel.id == loan_id, LoanModel.status == "scoring")
+            .values(score=score, status=status)
+            .returning(LoanModel)
         )
-        return Loan.from_record(record) if record else None
+        model = result.scalars().first()
+        return model.to_entity() if model else None
+
+    @handle_db_errors
+    async def apply_payment(
+        self, loan_id: str, amount: float, new_status: str,
+    ) -> Loan | None:
+        session = get_current_session()
+        result = await session.execute(
+            update(LoanModel)
+            .where(LoanModel.id == loan_id)
+            .values(
+                amount_paid=LoanModel.amount_paid + amount,
+                status=new_status,
+            )
+            .returning(LoanModel)
+        )
+        model = result.scalars().first()
+        await session.flush()
+        return model.to_entity() if model else None

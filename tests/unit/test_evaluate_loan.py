@@ -2,7 +2,10 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from entity.loan import Loan
-from exception.domain import EntityNotFoundError, AlreadyProcessedError
+from exception.domain import (
+    EntityNotFoundError,
+    InvalidOperationError,
+)
 from use_case.evaluate_loan import EvaluateLoan
 
 
@@ -76,3 +79,22 @@ async def test_evaluate_loan_not_found(mock_tx):
     use_case = EvaluateLoan(mock_repo, mock_scorer, min_score=600)
     with pytest.raises(EntityNotFoundError):
         await use_case.execute("l-999")
+
+
+@patch("use_case.evaluate_loan.transaction_context")
+async def test_evaluate_loan_not_pending(mock_tx):
+    mock_tx.return_value.__aenter__ = AsyncMock()
+    mock_tx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    approved_loan = Loan(
+        id="l-1", user_id="u-1", amount=1000.0, status="approved",
+        score=750, created_at="2025-01-01"
+    )
+    mock_repo = AsyncMock()
+    mock_repo.get_by_id.return_value = approved_loan
+
+    mock_scorer = AsyncMock()
+
+    use_case = EvaluateLoan(mock_repo, mock_scorer, min_score=600)
+    with pytest.raises(InvalidOperationError):
+        await use_case.execute("l-1")

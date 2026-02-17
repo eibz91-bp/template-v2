@@ -1,20 +1,19 @@
 import pytest
-from unittest.mock import AsyncMock, Mock
 
 from database.connection import Database
-from database.context import connection_context
+from database.context import session_context
 
 
 @pytest.fixture
 async def db():
-    """Integration test fixture: real DB connection with rollback."""
+    """Integration test fixture: real DB session with rollback."""
     test_db = Database()
-    await test_db.connect("postgresql://user:pass@localhost:5432/test_loans")
+    await test_db.connect(
+        "postgresql://user:pass@localhost:5432/test_loans"
+    )
 
-    async with connection_context(test_db) as conn:
-        transaction = conn.transaction()
-        await transaction.start()
-        yield conn
-        await transaction.rollback()
+    async with session_context(test_db) as session:
+        yield session
+        await session.rollback()
 
     await test_db.disconnect()

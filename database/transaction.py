@@ -1,20 +1,13 @@
 from contextlib import asynccontextmanager
-from functools import wraps
 
-from database.context import get_current_connection
+from database.context import get_current_session
 
 
 @asynccontextmanager
 async def transaction_context():
-    conn = get_current_connection()
-    async with conn.transaction():
-        yield
-
-
-def transactional(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        conn = get_current_connection()
-        async with conn.transaction():
-            return await func(*args, **kwargs)
-    return wrapper
+    session = get_current_session()
+    try:
+        yield session
+    except Exception:
+        await session.rollback()
+        raise

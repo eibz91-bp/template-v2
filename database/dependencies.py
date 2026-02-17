@@ -1,8 +1,8 @@
-from database.context import connection_context
+from fastapi import Request
 
-database = None
+from database.context import session_context
 
 
-async def get_db_connection():
-    async with connection_context(database):
+async def get_db_connection(request: Request):
+    async with session_context(request.app.state.database):
         yield

@@ -13,21 +13,24 @@ class EvaluateLoan:
     async def execute(self, loan_id: str):
         loan = await self.loan_repo.get_by_id(loan_id)
         self.ensure_exists(loan, "Loan not found")
+        loan.ensure_can_evaluate()
 
         # Transaction 1: mark as scoring (idempotent from pending)
-        async with transaction_context():
+        async with transaction_context() as tx:
             updated = await self.loan_repo.update_status_if(loan_id, "pending", "scoring")
             self.ensure_was_updated(updated)
+            await tx.commit()
 
         # Call external scorer (outside transaction)
         score = await self.score_provider.get_score(loan)
 
         # Determine result based on threshold
-        new_status = "approved" if score >= self.min_score else "rejected"
+        new_status = loan.determine_evaluation_status(score, self.min_score)
 
         # Transaction 2: save score + final status
-        async with transaction_context():
+        async with transaction_context() as tx:
             result = await self.loan_repo.save_evaluation(loan_id, score, new_status)
+            await tx.commit()
 
         return result
 
