@@ -1,8 +1,8 @@
 from fastapi import Request
 
-from controller.loan_controller import LoanController
-from controller.payment_controller import PaymentController
-from controller.user_controller import UserController
+from loan.infrastructure.http.controller.loan_controller import LoanController
+from payment.infrastructure.http.controller.payment_controller import PaymentController
+from user.infrastructure.http.controller.user_controller import UserController
 
 
 def get_user_controller(request: Request) -> UserController:

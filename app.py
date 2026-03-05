@@ -2,18 +2,20 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from api.v1 import loans, users, webhooks
+from loan.infrastructure.http.api.v1 import loans
+from user.infrastructure.http.api.v1 import users
+from payment.infrastructure.http.api.v1 import webhooks
 from config.settings import Settings, settings
-from database import dependencies as db_deps
+from shared.infrastructure.database import dependencies as db_deps
 from dependencies.container import build_container
-from exception.domain import DomainException
-from exception.http_handler import (
+from shared.domain.exception.domain import DomainException
+from shared.infrastructure.exception.http_handler import (
     catch_all_handler,
     database_handler,
     domain_handler,
     external_handler,
 )
-from exception.infrastructure import DatabaseException, ExternalServiceException
+from shared.infrastructure.exception.infrastructure import DatabaseException, ExternalServiceException
 
 
 def create_app(config: Settings = settings) -> FastAPI:

@@ -5,7 +5,10 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from model import Base
+from shared.infrastructure.database.base import Base
+import loan.infrastructure.model.loan_model  # noqa: F401
+import user.infrastructure.model.user_model  # noqa: F401
+import payment.infrastructure.model.payment_model  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

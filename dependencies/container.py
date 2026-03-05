@@ -3,24 +3,24 @@ from dataclasses import dataclass
 import httpx
 
 from config.settings import Settings
-from controller.loan_controller import LoanController
-from controller.payment_controller import PaymentController
-from controller.user_controller import UserController
-from database.connection import Database
-from factory.disburse_provider_factory import DisburseProviderFactory
-from repository.loan_query_repository import LoanQueryRepository
-from repository.loan_repository import LoanRepository
-from repository.payment_repository import PaymentRepository
-from repository.user_repository import UserRepository
-from service.nvio_disburse_service import NvioDisburseService
-from service.score_provider_service import ScoreProviderService
-from service.stp_disburse_service import StpDisburseService
-from use_case.disburse_loan import DisburseLoan
-from use_case.evaluate_loan import EvaluateLoan
-from use_case.get_loan_detail import GetLoanDetail
-from use_case.pay_loan import PayLoan
-from use_case.register_user import RegisterUser
-from use_case.request_loan import RequestLoan
+from loan.infrastructure.http.controller.loan_controller import LoanController
+from payment.infrastructure.http.controller.payment_controller import PaymentController
+from user.infrastructure.http.controller.user_controller import UserController
+from shared.infrastructure.database.connection import Database
+from loan.application.factory.disburse_provider_factory import DisburseProviderFactory
+from loan.infrastructure.adapter.persistence.sqlalchemy_loan_query_repository import SqlAlchemyLoanQueryRepository
+from loan.infrastructure.adapter.persistence.sqlalchemy_loan_repository import SqlAlchemyLoanRepository
+from payment.infrastructure.adapter.persistence.sqlalchemy_payment_repository import SqlAlchemyPaymentRepository
+from user.infrastructure.adapter.persistence.sqlalchemy_user_repository import SqlAlchemyUserRepository
+from loan.infrastructure.adapter.external.nvio_disburse_service import NvioDisburseService
+from loan.infrastructure.adapter.external.score_provider_service import ScoreProviderService
+from loan.infrastructure.adapter.external.stp_disburse_service import StpDisburseService
+from loan.application.use_case.disburse_loan import DisburseLoan
+from loan.application.use_case.evaluate_loan import EvaluateLoan
+from loan.application.use_case.get_loan_detail import GetLoanDetail
+from loan.application.use_case.pay_loan import PayLoan
+from user.application.use_case.register_user import RegisterUser
+from loan.application.use_case.request_loan import RequestLoan
 
 
 @dataclass(frozen=True)
@@ -38,10 +38,10 @@ def build_container(config: Settings) -> Container:
     http_client = httpx.AsyncClient(timeout=config.http_timeout)
 
     # --- Repositories ---
-    user_repo = UserRepository()
-    loan_repo = LoanRepository()
-    loan_query_repo = LoanQueryRepository()
-    payment_repo = PaymentRepository()
+    user_repo = SqlAlchemyUserRepository()
+    loan_repo = SqlAlchemyLoanRepository()
+    loan_query_repo = SqlAlchemyLoanQueryRepository()
+    payment_repo = SqlAlchemyPaymentRepository()
 
     # --- Services ---
     score_provider = ScoreProviderService(http_client, config.score_provider_url)

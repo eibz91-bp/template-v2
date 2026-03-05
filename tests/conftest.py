@@ -1,7 +1,7 @@
 import pytest
 
-from database.connection import Database
-from database.context import session_context
+from shared.infrastructure.database.connection import Database
+from shared.infrastructure.database.context import session_context
 
 
 @pytest.fixture

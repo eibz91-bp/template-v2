@@ -14,12 +14,12 @@ This is not about Clean Architecture, hexagonal, or DDD. It is about a set of si
 |---|---|---|---|
 | 1 | **Business does not depend on technology** | Exceptions don't know about HTTP. Entities don't know about SQLAlchemy. Use cases don't know about FastAPI. If you change the framework, the domain doesn't notice | 004, 009, 011, 012 |
 | 2 | **Code reads top to bottom** | A use case reads as a sequence: linear guards (preconditions that exit if they fail), then the happy path. Zero try/catch in business logic — exceptions bubble up and the handler translates them. Explicit commit, one pattern per problem. PEP 8 style enforced by tooling | 003, 004, 005, 013 |
-| 3 | **Dependencies go in one direction** | Controller → Use Case → Port ← Repository. Inner layers never import from outer ones. If an import goes "outward", something is wrong | 009, 012 |
+| 3 | **Dependencies go in one direction** | Controller → Use Case → Port ← Repository. Inner layers never import from outer ones. If an import goes "outward", something is wrong | 009, 012, 016 |
 | 4 | **Layers communicate through contracts** | The use case sees a Protocol, not a concrete class. If the implementation changes, the contract holds. Duck typing with static verification. mypy --strict ensures contracts are fulfilled before running | 009, 014 |
 | 5 | **Entities know their own rules** | The entity is an expert on itself: it knows if it can be evaluated, if it can be disbursed. It doesn't know how to save itself, it doesn't know how to call providers. That belongs to the system | 010 |
 | 6 | **Errors belong to the domain** | `InvalidOperationError`, not `HTTPException(422)`. The domain throws typed exceptions. Each protocol (HTTP, gRPC, CLI) translates them to its own format | 004 |
 | 7 | **Decisions are documented and can be challenged** | Every ADR has rejected options with justification. If the context changes, the decision can be reversed with the same transparency | This document |
-| 8 | **Discipline sustains everything else** | Patterns only work if the team follows them. A single sync `requests.post()` breaks async. A single try/catch in a use case breaks consistency. A `def f(x):` without types breaks the safety net. Ruff + mypy in CI = automatic enforcement | All |
+| 8 | **Discipline sustains everything else** | Patterns only work if the team follows them. A single sync `requests.post()` breaks async. A single try/catch in a use case breaks consistency. A `def f(x):` without types breaks the safety net. Flake8 + isort + black + mypy in CI = automatic enforcement | All |
 | 9 | **AI accelerates, humans decide** | AI generates code, proposes ADRs, writes tests. Humans review, challenge, and have the final word. No architectural decision is accepted just because AI suggested it | All |
 | 10 | **Complexity is added when it hurts, not before** | CQRS lite instead of event sourcing. Anemic until the entity needs rules. No outbox until eventual consistency requires it. The right abstraction is the one that solves a real problem, not an imaginary one | 007, 010 |
 
@@ -45,9 +45,10 @@ Each ADR is an instance of these principles applied to a concrete problem.
 | 010 | Entities as experts on themselves | Permanently anemic / Full rich entities |
 | 011 | schema/ (HTTP) + entity/ (domain) | One model for everything |
 | 012 | Manual container + app.state + Depends() | DI Container library / wiring in app.py |
-| 013 | PEP 8 +  Flake8 + isort + black |
+| 013 | PEP 8 + Flake8 + isort + black | Ruff (single tool) |
 | 014 | mypy --strict (financial project) | No type checking / basic mypy |
 | 015 | Poetry (financial project) | pip + requirements.txt / uv |
+| 016 | Bounded Context structure (domain/application/infrastructure) | Flat folders / monolithic layers |
 
 ---
 
@@ -150,7 +151,7 @@ A use case can call multiple repositories. If one fails after another has alread
 
 **Why NOT the others:**
 - **A) Manual transaction:** Repeated boilerplate in every use case. Easy to forget the rollback. The use case gets filled with infrastructure code.
-- **B) Single decorator:** Doesn't work for use cases that call third parties (Type 3). If you wrap everything in a transaction and the HTTP call to the third party takes 5 seconds, the connection stays blocked for 5 seconds with a lock on the table. Under load, the pool runs out. Also, the commit is invisible — hidden inside the decorator.
+- **B) Single decorator:** Doesn't work for use cases that call third parties (Type 2). If you wrap everything in a transaction and the HTTP call to the third party takes 5 seconds, the connection stays blocked for 5 seconds with a lock on the table. Under load, the pool runs out. Also, the commit is invisible — hidden inside the decorator.
 - **C) Decorator + Context Manager:** Works, but introduces two distinct patterns. The developer must choose which to use. The decorator hides the commit — a single explicit pattern is clearer.
 
 **Decision:** Option D — `transaction_context()` with explicit `await tx.commit()` for all use cases.
@@ -194,7 +195,7 @@ async with transaction_context() as tx:
 **Context:**
 Without an error strategy, each developer puts try/catch wherever they see fit. DB errors get exposed to the client (`IntegrityError`). Inconsistent responses (`{"error": "..."}` vs `{"message": "..."}` vs stack traces). Use cases and controllers full of try/catch that obscure business logic.
 
-Domain exceptions do not contain HTTP status codes. The mapping from exception to status code lives exclusively in `exception/http_handler.py`. This allows the same exceptions to be used in non-HTTP contexts (SQS consumers, CLI, workers, gRPC) without coupling to HTTP.
+Domain exceptions do not contain HTTP status codes. The mapping from exception to status code lives exclusively in `shared/infrastructure/exception/http_handler.py`. This allows the same exceptions to be used in non-HTTP contexts (SQS consumers, CLI, workers, gRPC) without coupling to HTTP.
 
 **Options considered:**
 
@@ -212,8 +213,8 @@ Domain exceptions do not contain HTTP status codes. The mapping from exception t
 
 **Justification:**
 - **`AppException` only has `message`**, no `status_code`. Exceptions are protocol-agnostic
-- **`http_handler.py`** uses `DOMAIN_STATUS_MAP` and `INFRA_STATUS_MAP` (dicts) to translate exception type → HTTP status code. Each future protocol (gRPC, CLI, SQS) can have its own handler without touching the exceptions
-- **Decorators (`@handle_db_errors`, `@handle_external_errors`)** in repos/services translate library errors to the app's hierarchy. The repo can do a targeted try/catch for errors with business meaning (e.g.: `IntegrityError → AlreadyExistsError`). Everything else → decorator → `DatabaseException`
+- **`shared/infrastructure/exception/http_handler.py`** uses `DOMAIN_STATUS_MAP` and `INFRA_STATUS_MAP` (dicts) to translate exception type → HTTP status code. Each future protocol (gRPC, CLI, SQS) can have its own handler without touching the exceptions
+- **Decorators (`@handle_db_errors`, `@handle_external_errors`)** in `shared/infrastructure/exception/decorators.py` translate library errors to the app's hierarchy. The repo can do a targeted try/catch for errors with business meaning (e.g.: `IntegrityError → AlreadyExistsError`). Everything else → decorator → `DatabaseException`
 - **Use cases and controllers:** ZERO try/catch. They only throw guards (`if not entity: raise EntityNotFoundError`). They read like a book
 - **HTTP Handler:** Catches by category (`DomainException`, `DatabaseException`, `ExternalServiceException`, `Exception`). One handler per category, zero `isinstance`. The `STATUS_MAP` centralizes the mapping
 
@@ -253,11 +254,11 @@ Repositories return data from the DB. Without conversion, everything remains as 
 
 | Data | Type | Where it lives | Why |
 |---|---|---|---|
-| HTTP Request | Pydantic | `schema/` | Automatic input validation |
-| ORM Model | SQLAlchemy Model | `model/` | Table mapping, `to_entity()` for conversion |
-| Domain Entity | dataclass | `entity/` | Autocomplete, types, future logic |
+| HTTP Request | Pydantic | `<context>/infrastructure/http/schema/` | Automatic input validation |
+| ORM Model | SQLAlchemy Model | `<context>/infrastructure/model/` | Table mapping, `to_entity()` for conversion |
+| Domain Entity | dataclass | `<context>/domain/entity/` | Autocomplete, types, future logic |
 | Pass-through data (JOINs) | dict | — | No unnecessary conversion |
-| HTTP Response | Pydantic | `schema/` | Controlled serialization |
+| HTTP Response | Pydantic | `<context>/infrastructure/http/schema/` | Controlled serialization |
 
 **Simple rule:** Does the use case access fields of the data to perform logic? → dataclass (via `model.to_entity()`). Does it just pass it to the response? → dict.
 
@@ -293,7 +294,7 @@ We need to access PostgreSQL and version schema changes. The decision between OR
 
 **Justification:**
 
-The `model/` layer is the **single source of truth** for the schema:
+The `<context>/infrastructure/model/` layer is the **single source of truth** for the schema:
 
 | Aspect | How it works |
 |---|---|
@@ -316,15 +317,19 @@ The `model/` layer is the **single source of truth** for the schema:
 **File structure:**
 
 ```
-model/
-├── __init__.py          # Exports Base + all models (for autogenerate)
-├── base.py              # DeclarativeBase
-├── user_model.py        # UserModel + to_entity()
-└── loan_model.py        # LoanModel + to_entity()
+shared/infrastructure/database/
+└── base.py                              # DeclarativeBase (shared across all contexts)
+
+<context>/infrastructure/model/
+├── __init__.py                          # Exports context models
+├── user_model.py                        # UserModel + to_entity()
+└── loan_model.py                        # LoanModel + to_entity()
 ```
 
+Alembic `env.py` imports `Base` from `shared/infrastructure/database/base.py` and all models from each context's `infrastructure/model/` to enable autogenerate across bounded contexts.
+
 **Consequences:**
-- (+) Single source of truth for the schema: `model/`
+- (+) Single source of truth for the schema: `<context>/infrastructure/model/`
 - (+) Autogenerated migrations — detects changes automatically
 - (+) Typed queries — column errors are detected at import, not at runtime
 - (+) asyncpg remains the driver (SQLAlchemy uses it internally) — same performance
@@ -346,20 +351,20 @@ We said "1 repo = 1 table". But when a use case needs data from multiple tables 
 | Option | Description |
 |---|---|
 | A) JOINs in write repos | Allow JOINs in the existing repos |
-| B) Separate read repos | `LoanRepository` (write, 1 table) + `LoanQueryRepository` (read, JOINs) |
+| B) Separate read repos | `SqlAlchemyLoanRepository` (write, 1 table) + `SqlAlchemyLoanQueryRepository` (read, JOINs) |
 | C) Full CQRS | 2 DB pools (primary + replica), event sourcing |
 
 **Why NOT the others:**
-- **A) JOINs in write repos:** Mixes responsibilities. A `LoanRepository` with CRUD + complex JOINs grows uncontrollably. Doesn't prepare for future scaling.
+- **A) JOINs in write repos:** Mixes responsibilities. A `SqlAlchemyLoanRepository` with CRUD + complex JOINs grows uncontrollably. Doesn't prepare for future scaling.
 - **C) Full CQRS:** Requires 2 DB nodes (primary + replica), event sourcing or change data capture, eventual consistency handling. Excessive complexity for the current state. We don't have a DB replica today.
 
 **Decision:** Option B — CQRS lite (separation at the code level).
 
 **Justification:**
-- **Today:** Both repos (`LoanRepository` and `LoanQueryRepository`) use `get_current_session()` and the same pool. The separation is code-level ONLY
+- **Today:** Both repos (`SqlAlchemyLoanRepository` and `SqlAlchemyLoanQueryRepository`) use `get_current_session()` and the same pool. The separation is code-level ONLY
 - **Future:** The day a DB replica is added:
   1. A second pool pointing to the replica is created
-  2. `LoanQueryRepository` switches to `get_read_session()`
+  2. `SqlAlchemyLoanQueryRepository` switches to `get_read_session()`
   3. Use cases and controllers are not touched
 - **Clarity:** Write repos are pure CRUD (1 table, easy to understand). Query repos are complex queries (JOINs, aggregations, dashboards)
 
@@ -441,9 +446,9 @@ In Clean Architecture, inner layers (use case) must not depend on outer layers (
 **Decision:** Option C — Python Protocols (structural duck typing).
 
 **Justification:**
-- **No inheritance:** `LoanRepository` doesn't inherit from anything. It fulfills the Protocol simply by having the same methods with the same signatures
+- **No inheritance:** `SqlAlchemyLoanRepository` doesn't inherit from anything. It fulfills the Protocol simply by having the same methods with the same signatures
 - **Statically verifiable:** `mypy --strict` detects if a repo doesn't fulfill a Protocol before running
-- **Pure DI:** app.py instantiates the concrete and passes it to the use case. The use case only sees the Protocol. If you change the implementation, you only touch app.py
+- **Pure DI:** `dependencies/container.py` instantiates the concrete and passes it to the use case. The use case only sees the Protocol. If you change the implementation, you only touch `container.py`
 - **Pythonic:** Protocols are the Python equivalent of interfaces — duck typing with static verification
 
 **Consequences:**
@@ -451,7 +456,7 @@ In Clean Architecture, inner layers (use case) must not depend on outer layers (
 - (+) Trivial tests: any mock that has the same methods fulfills the Protocol
 - (+) mypy/pyright detect incompatibilities before runtime
 - (-) Without mypy, Protocol errors are invisible — works the same as without interfaces
-- (-) One more layer of files (`port/`) to maintain
+- (-) One more layer of files (`<context>/domain/port/`) to maintain
 - (-) Protocols must be updated when a repo's signature changes
 
 ---
@@ -524,18 +529,18 @@ Initially we had `schema/` with Pydantic models that served both for HTTP valida
 - **A) One model for everything:** The model needs optional fields to cover request, response AND domain. `amount: float | None` because the response doesn't always include it, but the domain always has it. Confusion about which fields are required in which context.
 - **C) Pydantic for everything:** Pydantic validation has a cost. In the domain we don't need to re-validate data that already comes from the DB. Also, Pydantic models are immutable by default — if the entity needs to mutate (future: rich entities), that's unnecessary friction.
 
-**Decision:** Option B — `schema/` for HTTP DTOs (Pydantic), `entity/` for domain (dataclass).
+**Decision:** Option B — `<context>/infrastructure/http/schema/` for HTTP DTOs (Pydantic), `<context>/domain/entity/` for domain (dataclass).
 
 **Justification:**
-- **schema/:** Pydantic BaseModel. Only validates requests and serializes responses. Lives at the HTTP boundary
-- **entity/:** Python dataclass. Pure domain data. Used inside use cases for autocomplete and types. Conversion from DB lives in `model.to_entity()`
+- **schema/ (`<context>/infrastructure/http/schema/`):** Pydantic BaseModel. Only validates requests and serializes responses. Lives at the HTTP boundary
+- **entity/ (`<context>/domain/entity/`):** Python dataclass. Pure domain data. Used inside use cases for autocomplete and types. Conversion from DB lives in `model.to_entity()`
 - **Clear separation:** HTTP concerns (validation, serialization) don't contaminate the domain. The domain doesn't know about Pydantic or SQLAlchemy
 
 **Consequences:**
 - (+) Each layer has its appropriate data type
 - (+) Entities can grow into rich entities without Pydantic constraints
 - (+) HTTP schemas can change without affecting the domain
-- (-) More files (entity/ + schema/ instead of just schema/)
+- (-) More files (entity/ + schema/ in different layers instead of just schema/)
 - (-) Conversion needed: `asdict(entity)` → `Response(**asdict(entity))`. Minimal cost
 
 ---
@@ -572,7 +577,7 @@ The architecture separates 3 responsibilities:
 | Wiring (building the graph) | `dependencies/container.py` | `build_container(config)` → instantiates everything in order, returns a `Container` frozen dataclass |
 | Storage (available singletons) | `app.state` | Lifespan saves controllers and database in `app.state` |
 | Injection (endpoints receive deps) | `dependencies/providers.py` | `Depends()` functions that extract from `app.state` |
-| Endpoints (HTTP) | `api/v1/*.py` | Module-level `APIRouter`, use `Depends(get_*_controller)` |
+| Endpoints (HTTP) | `<context>/infrastructure/http/api/v1/*.py` | Module-level `APIRouter`, use `Depends(get_*_controller)` |
 | Composition root | `app.py` | `create_app()` — lifespan + exception handlers + include routers |
 
 **Flow:**
@@ -598,7 +603,7 @@ The architecture separates 3 responsibilities:
 
 ---
 
-## ADR-013: Code style — PEP 8 + Ruff as linter
+## ADR-013: Code style — PEP 8 + Flake8 + isort + black
 
 **Status:** Accepted
 
@@ -610,34 +615,40 @@ Without a style standard, each developer writes differently: tabs vs spaces, uno
 | Option | Description |
 |---|---|
 | A) No linter | Each developer follows PEP 8 "by eye", corrected in code review |
-| B) Flake8 + isort + black | Classic stack: 3 separate tools with separate configs |
+| B) Flake8 + isort + black | Classic stack: linting, import sorting, and formatting |
 | C) Ruff | A single linter/formatter that replaces flake8, isort, black, pyflakes, pycodestyle |
 
 **Why NOT the others:**
 - **A) No linter:** Code reviews become style discussions. "Put a space here", "that line is too long". Unproductive and subjective.
-- **B) Flake8 + isort + black:** Three tools with 3 configs (`setup.cfg`, `.isort.cfg`, `pyproject.toml`). Conflicts between them (black reformats, flake8 complains about black's format). Ruff does the same in a single tool, 10-100x faster.
+- **C) Ruff:** Single tool, but younger ecosystem. Less battle-tested in enterprise. Flake8 + isort + black is the proven standard with broader plugin ecosystem and team familiarity.
 
-**Decision:** Option C — PEP 8 as standard, Ruff as enforcement.
+**Decision:** Option B — PEP 8 as standard, enforced by Flake8 (linting) + isort (import sorting) + black (formatting).
 
 **Justification:**
 - **PEP 8** is the de facto Python standard. We don't invent our own rules
-- **Ruff** (`ruff check .`) executes in milliseconds — can be run in pre-commit, in CI, and on every editor save
-- **Minimal config** in `pyproject.toml`: `select = ["E", "W", "F", "ASYNC"]` — errors, warnings, pyflakes, and async rules
-- **Line length 88** (ruff/black default) — balance between readability and screen utilization
+- **Flake8** detects style errors, unused imports, undefined variables. Extensible via plugins (`flake8-async` for async rules)
+- **isort** sorts imports automatically — no manual ordering. Compatible with black via `profile = "black"`
+- **black** reformats code deterministically — zero style debates. "Any color you like, as long as it's black"
+- **All three** can run in pre-commit, in CI, and on every editor save
+- **Line length 88** (black default) — balance between readability and screen utilization
+- **Config** centralized in `pyproject.toml` for all three tools
 
-**Rules enabled:**
+**Rules enabled (Flake8):**
 
 | Code | What it covers |
 |---|---|
 | `E` | PEP 8 style errors (indentation, whitespace, line length) |
 | `W` | PEP 8 warnings |
 | `F` | Pyflakes (unused imports, undefined variables, shadowing) |
-| `ASYNC` | Async-specific rules (missing await, blocking calls) |
+| `ASYNC` | Async-specific rules via flake8-async (missing await, blocking calls) |
 
 **Consequences:**
 - (+) Zero style discussions in code reviews
-- (+) A single tool replaces flake8 + isort + black
-- (+) Millisecond execution — doesn't slow down the developer
+- (+) Battle-tested tools with broad ecosystem and plugin support
+- (+) Deterministic formatting with black — same input always produces same output
+- (+) isort + black compatible via `profile = "black"` — no conflicts
+- (-) Three tools to install and configure instead of one
+- (-) Slightly slower than Ruff — but fast enough for pre-commit and CI
 - (-) Line length 88 can feel short for long ORM queries — solved with line breaks, not by disabling the rule
 
 ---
@@ -724,7 +735,7 @@ A financial system that disburses loans cannot have different behavior between w
 | Aspect | How Poetry solves it |
 |---|---|
 | Deterministic lock | `poetry.lock` pins ALL versions (direct + transitive). `poetry install` installs exactly what was tested |
-| Dev/prod separation | `[tool.poetry.group.dev.dependencies]` — `pytest`, `ruff`, `mypy` never reach the production image |
+| Dev/prod separation | `[tool.poetry.group.dev.dependencies]` — `pytest`, `flake8`, `isort`, `black`, `mypy` never reach the production image |
 | Conflict resolver | If `fastapi` requires `pydantic>=2.0` and another package requires `pydantic<2.0`, Poetry fails at resolution — not at runtime |
 | PEP standard | `pyproject.toml` is the standard (PEP 621). Config for ruff, pytest, mypy — all in a single file |
 | Reproducibility | `poetry install --no-dev` in Docker = exactly what was tested in CI |
@@ -743,5 +754,192 @@ A financial system that disburses loans cannot have different behavior between w
 - (-) Poetry is slower than pip/uv for installation (~seconds extra in CI)
 - (-) The team needs to learn Poetry commands (`poetry add`, `poetry lock`, `poetry shell`)
 - (-) Dependency resolution can be slow with many packages — mitigable with `--no-update` in CI
+
+---
+
+## ADR-016: Bounded Context Structure — domain / application / infrastructure
+
+**Status:** Accepted
+
+**Context:**
+As the microservice grows, a flat folder structure (`entity/`, `use_case/`, `repository/`, `service/`, etc.) mixes all domains together. A loan entity, a payment entity, and a user entity all live in the same `entity/` folder. When the team needs to understand "everything about loans", they have to hunt across 10+ top-level folders. Adding a second bounded context (e.g., payments) makes the flat structure unsustainable — files from different contexts interleave.
+
+We need a structure that:
+1. Groups code by business domain (bounded context), not by technical layer
+2. Maintains strict dependency direction within each context
+3. Supports multiple bounded contexts in a single microservice
+4. Shares cross-cutting infrastructure (database connection, base exceptions) without duplication
+
+**Options considered:**
+
+| Option | Description |
+|---|---|
+| A) Flat folders | Current: `entity/`, `use_case/`, `repository/` — all domains mixed |
+| B) Monolithic layers | `domain/`, `application/`, `infrastructure/` at root — one set of layers, all domains inside |
+| C) Bounded contexts with 3 layers | `loan/domain/`, `loan/application/`, `loan/infrastructure/` — each context owns its layers + `shared/` kernel |
+
+**Why NOT the others:**
+- **A) Flat folders:** Works for a single small domain but doesn't scale. Adding payments means `entity/loan.py` and `entity/payment.py` in the same folder. No clear boundary between contexts. Imports between contexts are invisible — any file can import any other.
+- **B) Monolithic layers:** Better separation by layer but still mixes domains. `domain/entity/loan.py` and `domain/entity/payment.py` share the same folder. Doesn't enforce boundaries between contexts. A payment use case can silently import a loan repository port.
+
+**Decision:** Option C — Bounded contexts with 3 layers each + shared kernel.
+
+**Justification:**
+
+Each bounded context follows the same internal structure:
+
+```
+<context>/
+├── domain/           # Pure business: entities, ports, domain exceptions
+│   ├── entity/       # @dataclass with own rules
+│   ├── port/         # typing.Protocol contracts
+│   └── exception/    # Context-specific domain exceptions (if needed)
+│
+├── application/      # Orchestration: use cases, factories
+│   ├── use_case/     # 1 class = 1 operation
+│   └── factory/      # Strategy selection
+│
+└── infrastructure/   # Everything external: DB, HTTP, frameworks
+    ├── adapter/
+    │   ├── persistence/   # SqlAlchemy*Repository implementations
+    │   └── external/      # HTTP service integrations
+    ├── model/             # SQLAlchemy ORM models
+    ├── http/
+    │   ├── controller/    # Presentation: receive, delegate, return
+    │   ├── schema/        # Pydantic request/response DTOs
+    │   └── api/v1/        # APIRouter endpoints
+```
+
+**Full project structure:**
+
+```
+template/
+├── app.py                          # Composition root: create_app() + lifespan
+├── config/settings.py              # pydantic-settings with env_prefix
+│
+├── loan/                           # ← Bounded Context
+│   ├── domain/
+│   │   ├── entity/loan.py          # Loan dataclass
+│   │   ├── entity/result.py        # Result dataclass
+│   │   ├── port/loan_repository_port.py
+│   │   ├── port/loan_query_repository_port.py
+│   │   └── port/disburse_provider_port.py
+│   ├── application/
+│   │   ├── use_case/request_loan.py
+│   │   ├── use_case/evaluate_loan.py
+│   │   ├── use_case/disburse_loan.py
+│   │   ├── use_case/get_loan_detail.py
+│   │   └── factory/disburse_provider_factory.py
+│   └── infrastructure/
+│       ├── adapter/persistence/sqlalchemy_loan_repository.py
+│       ├── adapter/persistence/sqlalchemy_loan_query_repository.py
+│       ├── adapter/external/stp_disburse_service.py
+│       ├── adapter/external/nvio_disburse_service.py
+│       ├── model/loan_model.py
+│       ├── http/controller/loan_controller.py
+│       ├── http/schema/loan_schema.py
+│       └── http/api/v1/loans.py
+│
+├── shared/                         # ← Shared Kernel
+│   ├── domain/
+│   │   ├── entity/                 # Cross-domain value objects (Money, etc.)
+│   │   └── exception/
+│   │       ├── base.py             # AppException(message)
+│   │       └── domain.py           # DomainException hierarchy
+│   └── infrastructure/
+│       ├── database/
+│       │   ├── base.py             # DeclarativeBase (shared across all contexts)
+│       │   ├── connection.py       # Database: engine + session_factory
+│       │   ├── context.py          # session_context + get_current_session
+│       │   ├── transaction.py      # transaction_context + explicit commit
+│       │   └── dependencies.py     # Depends(get_db_connection) for FastAPI
+│       └── exception/
+│           ├── infrastructure.py   # DatabaseException, ExternalServiceException
+│           ├── decorators.py       # @handle_db_errors, @handle_external_errors
+│           └── http_handler.py     # STATUS_MAP: exception type → HTTP code
+│
+├── dependencies/                   # Global DI
+│   ├── container.py                # build_container() → complete wiring
+│   └── providers.py                # Depends() that extract from app.state
+│
+├── migrations/                     # Alembic autogenerate from model/
+├── pyproject.toml
+└── tests/
+    ├── unit/
+    │   └── loan/                   # Mirrors bounded context structure
+    └── integration/
+        └── loan/
+```
+
+**Naming conventions:**
+
+| Concept | Name pattern | Example | Location |
+|---|---|---|---|
+| Port (contract) | `<Entity><Action>Port` | `LoanRepositoryPort` | `<context>/domain/port/` |
+| Persistence adapter | `SqlAlchemy<Entity>Repository` | `SqlAlchemyLoanRepository` | `<context>/infrastructure/adapter/persistence/` |
+| External adapter | `<Provider><Action>Service` | `StpDisburseService` | `<context>/infrastructure/adapter/external/` |
+| Entity | `<Entity>` | `Loan` | `<context>/domain/entity/` |
+| Use case | `<Action><Entity>` | `DisburseLoan` | `<context>/application/use_case/` |
+| Controller | `<Entity>Controller` | `LoanController` | `<context>/infrastructure/http/controller/` |
+| Schema | `<Action><Entity>Request/Response` | `DisburseLoanRequest` | `<context>/infrastructure/http/schema/` |
+| ORM model | `<Entity>Model` | `LoanModel` | `<context>/infrastructure/model/` |
+
+**Dependency direction within a bounded context:**
+
+```
+infrastructure/ ──► application/ ──► domain/
+                                      │
+                              Entity + Port + Exception
+                              (depend on nothing external)
+```
+
+- `domain/` never imports from `application/` or `infrastructure/`
+- `application/` never imports from `infrastructure/` — depends on ports (Protocols)
+- `infrastructure/` implements ports, imports entities for conversion
+
+**Shared kernel rules:**
+
+- `shared/` contains infrastructure used by ALL contexts: database connection/session/transaction, base exception hierarchy, error decorators, HTTP handler
+- Every bounded context imports from `shared/` — never the reverse
+- `shared/` never imports from any bounded context
+- Cross-domain value objects (e.g., `Money`) live in `shared/domain/entity/`
+- Database is ONE pool/engine/session_factory — contexts share the connection, each has its own models and repos
+
+**Inter-context communication rules:**
+
+- A bounded context NEVER directly imports another context's repository or use case
+- If context A needs data from context B: context B exposes a domain service (sync) or domain event (async)
+- Domain services live in the providing context's `application/` layer
+- Start simple (direct service call), add events when async decoupling is needed
+
+**Import examples:**
+
+```python
+# loan/infrastructure/adapter/persistence/sqlalchemy_loan_repository.py
+from shared.infrastructure.database.context import get_current_session
+from shared.infrastructure.exception.decorators import handle_db_errors
+from loan.domain.entity.loan import Loan
+from loan.infrastructure.model.loan_model import LoanModel
+
+# loan/application/use_case/disburse_loan.py
+from shared.infrastructure.database.transaction import transaction_context
+from loan.domain.port.loan_repository_port import LoanRepositoryPort
+from loan.domain.port.disburse_provider_port import DisburseProviderPort
+
+# loan/infrastructure/http/controller/loan_controller.py
+from loan.infrastructure.http.schema.loan_schema import DisburseLoanRequest, DisburseLoanResponse
+```
+
+**Consequences:**
+- (+) Clear boundaries: "everything about loans" is in `loan/`
+- (+) Adding a new bounded context = creating a new top-level folder with the same 3-layer structure
+- (+) Dependency violations between contexts are visible in imports
+- (+) Each context can evolve independently — different complexity levels per context
+- (+) Shared infrastructure avoids duplication of database/exception boilerplate
+- (+) Naming conventions make adapter technology explicit (`SqlAlchemy*`, `Stp*`)
+- (-) Deeper folder nesting than flat structure
+- (-) More `__init__.py` files to maintain
+- (-) Moving from flat to bounded context requires a migration of all imports
+- (-) Small contexts (e.g., a simple CRUD with 1 entity) may feel over-structured — acceptable trade-off for consistency
 
 ---
